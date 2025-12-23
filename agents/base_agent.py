@@ -445,126 +445,6 @@ class BaseAgent:
         except Exception as e:
             return None
 
-    def predict(self, X, n_samples: Optional[int] = None, current_price: float | None = None):
-        """
-        예측 수행
-        
-        Args:
-            X: 입력 데이터
-            n_samples: 샘플링 횟수
-            current_price: 현재가
-            
-        Returns:
-            Target: 예측된 종가, 불확실성, 신뢰도 포함
-        """
-
-        if n_samples is None:
-            n_samples = common_params.get("n_samples", 30)
-
-        X_original = X
-
-
-        if StockData is not None and isinstance(X, StockData):
-            for name in ["X", "x", "X_seq", "data", "inputs"]:
-                if hasattr(X, name):
-                    X_arr = getattr(X, name)
-                    break
-            else:
-                X_arr = None
-                if hasattr(X, "__dict__"):
-                    for name, val in X.__dict__.items():
-                        if isinstance(val, (np.ndarray, torch.Tensor)):
-                            X_arr = val
-                            break
-                
-                if X_arr is None:
-                    raise AttributeError("StockData에서 입력 배열을 찾을 수 없습니다.")
-            X = X_arr
-
-        if isinstance(X, torch.Tensor):
-            X_tensor = X.float()
-        else:
-            X_np = np.asarray(X, dtype=np.float32)
-            X_tensor = torch.from_numpy(X_np)
-
-        if X_tensor.dim() == 2:
-            X_tensor = X_tensor.unsqueeze(0)
-
-        if hasattr(self, "device"):
-            device = self.device
-        elif hasattr(self, "model") and hasattr(self.model, "parameters"):
-            try:
-                device = next(self.model.parameters()).device
-            except StopIteration:
-                device = torch.device("cpu")
-        else:
-            device = torch.device("cpu")
-
-        X_tensor = X_tensor.to(device)
-
-        if self.model is None:
-             if not self.load_model():
-                 if not self._in_pretrain:
-                     print(f"[{self.agent_id}] 모델이 로드되지 않아 pretrain을 시도합니다.")
-                     self._in_pretrain = True
-                     try:
-                         self.pretrain()
-                     finally:
-                         self._in_pretrain = False
-                 else:
-                     raise RuntimeError(f"[{self.agent_id}] pretrain 중 predict 호출로 인한 재귀 호출 방지")
-
-        self.model.train()
-        preds = []
-        with torch.no_grad():
-            for _ in range(n_samples):
-                out = self.model(X_tensor)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
-                preds.append(out.detach().cpu().numpy())
-
-        preds_arr = np.stack(preds, axis=0)
-        mean_pred = preds_arr.mean(axis=0).squeeze()
-        std_pred = preds_arr.std(axis=0).squeeze()
-
-        if np.ndim(std_pred) > 0:
-            sigma = float(std_pred[-1])
-        else:
-            sigma = float(std_pred)
-
-        confidence = self._calculate_confidence_from_direction_accuracy()
-        # 방향 정확도만 사용 (fallback 제거)
-
-        X_arr_for_price = X_tensor.detach().cpu().numpy()
-        current_price_val = self._extract_current_price(
-            X_original,
-            input_array=X_arr_for_price,
-            current_price=current_price,
-        )
-
-        mean_pred = np.asarray(mean_pred)
-        if mean_pred.ndim == 0:
-            predicted_return = float(mean_pred)
-        else:
-            predicted_return = float(mean_pred[-1])
-
-        predicted_price = current_price_val * (1.0 + predicted_return)
-
-        if std_pred is not None:
-            std_pred = np.asarray(std_pred)
-            if std_pred.ndim == 0:
-                uncertainty = float(std_pred)
-            else:
-                uncertainty = float(std_pred[-1])
-        else:
-            uncertainty = None
-
-        target = Target(
-            next_close=predicted_price,
-            uncertainty=uncertainty,
-            confidence=confidence,
-        )
-        return target
 
     def review_draft(self, stock_data=None, target=None):
         """초기 의견을 생성합니다"""
@@ -1101,16 +981,33 @@ class BaseAgent:
             raise ValueError(f"_msg() 인자 오류: role={role}, content={type(content)}")
         return {"role": role, "content": content}
 
+    def _safe_float(self, v: Optional[float], default: float) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
 
 class DataScaler:
     """데이터 정규화를 담당하는 클래스"""
+
     def __init__(self, agent_id, scaler_dir: Optional[str] = None):
         self.agent_id = agent_id
+
         if scaler_dir is None:
-            scaler_dir = dir_info.get("scaler_dir", os.path.join(dir_info["model_dir"], "scalers"))
+            scaler_dir = dir_info.get(
+                "scaler_dir",
+                os.path.join(dir_info["model_dir"], "scalers")
+            )
         self.save_dir = scaler_dir
-        self.x_scaler = agents_info[self.agent_id]["x_scaler"]
-        self.y_scaler = agents_info[self.agent_id]["y_scaler"]
+
+        # 🔴 여기서는 "이름"만 보관
+        self.x_scaler_name = agents_info[self.agent_id].get("x_scaler", "None")
+        self.y_scaler_name = agents_info[self.agent_id].get("y_scaler", "None")
+
+        # 🔴 실제 scaler 객체는 None으로 시작
+        self.x_scaler = None
+        self.y_scaler = None
 
     def fit_scalers(self, X_train, y_train):
         """스케일러를 학습합니다"""
@@ -1119,57 +1016,99 @@ class DataScaler:
             "MinMaxScaler": MinMaxScaler,
             "RobustScaler": RobustScaler,
             "None": None,
+            None: None,
         }
-        Sx = ScalerMap.get(self.x_scaler)
-        Sy = ScalerMap.get(self.y_scaler)
 
-        n_samples, seq_len, n_feats = X_train.shape
-        X_2d = X_train.reshape(-1, n_feats)
-        self.x_scaler = Sx().fit(X_2d) if Sx else None
-        
-        if Sy == MinMaxScaler:
-            cfg = agents_info.get(self.agent_id, {})
-            feature_range = cfg.get("minmax_scaler_range", (0, 1))
-            self.y_scaler = Sy(feature_range=feature_range).fit(y_train.reshape(-1, 1))
+        Sx = ScalerMap.get(self.x_scaler_name)
+        Sy = ScalerMap.get(self.y_scaler_name)
+
+        # ---------- X scaler ----------
+        if Sx is not None:
+            n_samples, seq_len, n_feats = X_train.shape
+            X_2d = X_train.reshape(-1, n_feats)
+            self.x_scaler = Sx().fit(X_2d)
         else:
-            self.y_scaler = Sy().fit(y_train.reshape(-1, 1)) if Sy else None
+            self.x_scaler = None
+
+        # ---------- Y scaler ----------
+        if Sy is not None:
+            if Sy is MinMaxScaler:
+                cfg = agents_info.get(self.agent_id, {})
+                feature_range = cfg.get("minmax_scaler_range", (0, 1))
+                self.y_scaler = Sy(feature_range=feature_range).fit(
+                    y_train.reshape(-1, 1)
+                )
+            else:
+                self.y_scaler = Sy().fit(y_train.reshape(-1, 1))
+        else:
+            self.y_scaler = None
 
     def transform(self, X, y=None):
         """데이터를 변환합니다"""
-        if X.ndim == 3:
-            n_samples, seq_len, n_feats = X.shape
-            X_2d = X.reshape(-1, n_feats)
-            X_t = self.x_scaler.transform(X_2d).reshape(n_samples, seq_len, n_feats) if self.x_scaler else X
+        # ---------- X ----------
+        if self.x_scaler is not None:
+            if X.ndim == 3:
+                n_samples, seq_len, n_feats = X.shape
+                X_2d = X.reshape(-1, n_feats)
+                X_t = self.x_scaler.transform(X_2d).reshape(
+                    n_samples, seq_len, n_feats
+                )
+            else:
+                X_t = self.x_scaler.transform(X)
         else:
-            X_t = self.x_scaler.transform(X) if self.x_scaler else X
+            X_t = X
 
+        # ---------- Y ----------
         y_t = y
-        if y is not None and self.y_scaler:
+        if y is not None and self.y_scaler is not None:
             y_t = self.y_scaler.transform(y.reshape(-1, 1)).flatten()
-            
+
         return X_t, y_t
 
     def inverse_y(self, y_pred):
         """Y 값을 역변환합니다"""
-        if self.y_scaler and self.y_scaler != "None" and hasattr(self.y_scaler, 'inverse_transform'):
-            if isinstance(y_pred, (list, tuple)):
-                y_pred = np.array(y_pred)
-            return self.y_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
-        return y_pred
+        if self.y_scaler is None:
+            return y_pred
+
+        if isinstance(y_pred, (list, tuple)):
+            y_pred = np.array(y_pred)
+
+        return self.y_scaler.inverse_transform(
+            y_pred.reshape(-1, 1)
+        ).flatten()
 
     def save(self, ticker):
         """스케일러를 저장합니다"""
         os.makedirs(self.save_dir, exist_ok=True)
-        if self.x_scaler:
-            joblib.dump(self.x_scaler, os.path.join(self.save_dir, f"{ticker}_{self.agent_id}_xscaler.pkl"))
-        if self.y_scaler:
-            joblib.dump(self.y_scaler, os.path.join(self.save_dir, f"{ticker}_{self.agent_id}_yscaler.pkl"))
+
+        if self.x_scaler is not None:
+            joblib.dump(
+                self.x_scaler,
+                os.path.join(
+                    self.save_dir,
+                    f"{ticker}_{self.agent_id}_xscaler.pkl"
+                )
+            )
+
+        if self.y_scaler is not None:
+            joblib.dump(
+                self.y_scaler,
+                os.path.join(
+                    self.save_dir,
+                    f"{ticker}_{self.agent_id}_yscaler.pkl"
+                )
+            )
 
     def load(self, ticker):
         """스케일러를 로드합니다"""
-        x_path = os.path.join(self.save_dir, f"{ticker}_{self.agent_id}_xscaler.pkl")
-        y_path = os.path.join(self.save_dir, f"{ticker}_{self.agent_id}_yscaler.pkl")
-        if os.path.exists(x_path):
-            self.x_scaler = joblib.load(x_path)
-        if os.path.exists(y_path):
-            self.y_scaler = joblib.load(y_path)
+        x_path = os.path.join(
+            self.save_dir,
+            f"{ticker}_{self.agent_id}_xscaler.pkl"
+        )
+        y_path = os.path.join(
+            self.save_dir,
+            f"{ticker}_{self.agent_id}_yscaler.pkl"
+        )
+
+        self.x_scaler = joblib.load(x_path) if os.path.exists(x_path) else None
+        self.y_scaler = joblib.load(y_path) if os.path.exists(y_path) else None

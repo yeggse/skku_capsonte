@@ -16,6 +16,7 @@ from agents.base_agent import (
 
 from config.agents_set import agents_info, dir_info, common_params
 from config.prompts import OPINION_PROMPTS, REBUTTAL_PROMPTS, REVISION_PROMPTS
+from core.base_classes.base_predict import BaseAgentPredictMixin
 from core.technical_classes.technical_explainer import TechnicalExplainer
 from core.technical_classes.technical_data_set import load_dataset
 
@@ -33,7 +34,7 @@ def round_num(value: Union[float, int, str], decimals: int = 4) -> float:
     except (ValueError, TypeError):
         return value
 
-class TechnicalAgent(BaseAgent, nn.Module):
+class TechnicalAgent(BaseAgent, nn.Module, BaseAgentPredictMixin):
     """
     기술적 분석 기반 주가 예측 에이전트
     
@@ -160,16 +161,17 @@ class TechnicalAgent(BaseAgent, nn.Module):
                 "agent_id": self.agent_id,
                 "next_close": float(my_opinion.target.next_close),
                 "reason": str(my_opinion.reason)[:2000],
-                "uncertainty": float(my_opinion.target.uncertainty),
-                "confidence": float(my_opinion.target.confidence),
+                "uncertainty": self._safe_float(my_opinion.target.uncertainty, 0.0),
+                "confidence": self._safe_float(my_opinion.target.confidence, 0.5),
             },
             "other": {
                 "agent_id": target_opinion.agent_id,
                 "next_close": float(target_opinion.target.next_close),
                 "reason": str(target_opinion.reason)[:2000],
-                "uncertainty": float(target_opinion.target.uncertainty),
-                "confidence": float(target_opinion.target.confidence),
-            }
+                "uncertainty": self._safe_float(target_opinion.target.uncertainty, 0.0),
+                "confidence": self._safe_float(target_opinion.target.confidence, 0.5),
+            },
+
         }
     
         for col, values in agent_data.items():
@@ -216,8 +218,17 @@ class TechnicalAgent(BaseAgent, nn.Module):
             "agent_type": self.agent_id,
             "my_opinion": {
                 "predicted_price": float(my_opinion.target.next_close),
-                "confidence": float(my_opinion.target.confidence),
-                "uncertainty": float(my_opinion.target.uncertainty),
+                "uncertainty": (
+                    float(my_opinion.target.uncertainty)
+                    if my_opinion.target.uncertainty is not None
+                    else 0.0
+                ),
+                "confidence": (
+                    float(my_opinion.target.confidence)
+                    if my_opinion.target.confidence is not None
+                    else 0.5
+                ),
+
                 "reason": str(my_opinion.reason)[:1000],
             },
             "others_summary": others_summary,
@@ -696,202 +707,5 @@ class TechnicalAgent(BaseAgent, nn.Module):
             "n_samples": len(predictions),
         }
 
-
-    # 예측 및 불확실성 추정
-    def predict(self, X, n_samples: Optional[int] = None, current_price: Optional[float] = None):
-        if n_samples is None:
-            n_samples = common_params.get("n_samples", 30)
-
-        if not self.ticker:
-            raise ValueError("ticker가 설정되지 않았습니다. 먼저 searcher(ticker)를 호출하세요.")
-
-        # 1. 모델 & 스케일러 보장
-        self._ensure_model_and_scaler()
-
-        # 2. 입력 정규화
-        X_raw_np, current_price = self._prepare_input(X, current_price)
-
-        # 3. 스케일링
-        X_tensor = self._scale_input(X_raw_np)
-
-        # 4. Monte Carlo Dropout
-        preds = self._run_mc_dropout(X_tensor, n_samples)
-
-        # 5. 평균 / 표준편차
-        mean_pred, std_pred = self._postprocess_prediction(preds)
-
-        # 6. Target 생성
-        return self._build_target(mean_pred, std_pred, current_price)
-
-    def _scale_input(self, X_raw_np: np.ndarray) -> torch.Tensor:
-        """
-        입력 데이터를 학습 스케일로 변환
-        """
-        X_scaled, _ = self.scaler.transform(X_raw_np)
-        device = next(self.parameters()).device
-        return torch.tensor(X_scaled, dtype=torch.float32).to(device)
-
-    def _run_mc_dropout(self, X_tensor: torch.Tensor, n_samples: int,) -> np.ndarray:
-        """
-        MC Dropout 기반 다중 샘플 예측
-        """
-        self.train()  # Dropout 활성화
-        preds = []
-
-        with torch.no_grad():
-            for _ in range(n_samples):
-                y_pred = self(X_tensor).cpu().numpy().flatten()
-                preds.append(y_pred)
-
-        return np.stack(preds)
-
-    def _postprocess_prediction(self, preds: np.ndarray,) -> tuple[np.ndarray, np.ndarray]:
-        """
-        평균 및 표준편차 계산 + 역스케일링
-        """
-        mean_pred = preds.mean(axis=0)
-        std_pred = np.abs(preds.std(axis=0))
-
-        if hasattr(self.scaler, "y_scaler") and self.scaler.y_scaler is not None:
-            mean_pred = self.scaler.inverse_y(mean_pred)
-            std_pred = self.scaler.inverse_y(std_pred)
-
-        return mean_pred, std_pred
-
-    def _build_target(self, mean_pred: np.ndarray, std_pred: np.ndarray, current_price: float,) -> Target:
-        """
-        예측 결과를 Target 객체로 변환
-        """
-        # 불확실성
-        sigma = float(std_pred[-1])
-        sigma_min = common_params.get("sigma_min", 1e-6)
-        sigma = max(sigma, sigma_min)
-
-        # 신뢰도
-        confidence = self._calculate_confidence_from_direction_accuracy()
-        if confidence is None:
-            confidence = 0.5
-
-        # 수익률 변환
-        y_scale_factor = common_params.get("y_scale_factor", 100.0)
-        predicted_return = float(mean_pred[-1]) / y_scale_factor
-
-        cfg = agents_info.get(self.agent_id, {})
-        predicted_return = np.clip(
-            predicted_return,
-            cfg.get("return_clip_min", -0.5),
-            cfg.get("return_clip_max", 0.5),
-        )
-
-        predicted_price = current_price * (1 + predicted_return)
-
-        return Target(
-            next_close=float(predicted_price),
-            uncertainty=sigma,
-            confidence=confidence,
-            predicted_return=float(predicted_return),
-        )
-
-    def _ensure_model_and_scaler(self):
-        """
-        모델과 스케일러가 준비되어 있는지 보장
-        없으면 pretrain 수행
-        """
-        if not self.ticker:
-            raise ValueError("ticker가 설정되지 않았습니다.")
-
-        model_path = os.path.join(self.model_dir, f"{self.ticker}_{self.agent_id}.pt")
-
-        # ---- 모델 확인 ----
-        if not os.path.exists(model_path):
-            if not getattr(self, "_in_pretrain", False):
-                print(f"[{self.agent_id}] 모델이 없어 pretrain() 실행")
-                self._in_pretrain = True
-                try:
-                    self.pretrain()
-                finally:
-                    self._in_pretrain = False
-            else:
-                raise RuntimeError("pretrain 중 predict 재귀 호출")
-        else:
-            if not getattr(self, "model_loaded", False):
-                self.load_model()
-
-        # ---- 스케일러 확인 ----
-        scaler_x_path = os.path.join(
-            self.scaler.save_dir,
-            f"{self.ticker}_{self.agent_id}_xscaler.pkl"
-        )
-
-        if not os.path.exists(scaler_x_path):
-            if not getattr(self, "_in_pretrain", False):
-                print(f"[{self.agent_id}] 스케일러가 없어 pretrain() 실행")
-                self._in_pretrain = True
-                try:
-                    self.pretrain()
-                finally:
-                    self._in_pretrain = False
-            else:
-                raise RuntimeError("pretrain 중 predict 재귀 호출")
-
-        self.scaler.load(self.ticker)
-
-    def _prepare_input( self, X, current_price: Optional[float],):
-        """
-        predict 입력(X)을 numpy array로 변환하고
-        current_price를 보정하여 반환
-        """
-        # -------------------------------------------------
-        # StockData 입력 처리
-        # -------------------------------------------------
-        if isinstance(X, StockData):
-            sd = X
-            X_in = getattr(sd, "X_seq", None)
-
-            if X_in is None:
-                X_in = getattr(sd, self.agent_id, None)
-
-                if isinstance(X_in, dict):
-                    feature_cols = getattr(sd, "feature_cols", None)
-                    if feature_cols:
-                        ordered = {c: X_in[c] for c in feature_cols if c in X_in}
-                        df = pd.DataFrame(ordered, columns=feature_cols)
-                    else:
-                        df = pd.DataFrame(X_in)
-                    X_in = df.values
-
-            if X_in is None:
-                raise ValueError(f"StockData에 {self.agent_id} 데이터가 없습니다.")
-
-            if current_price is None and getattr(sd, "last_price", None) is not None:
-                current_price = float(sd.last_price)
-
-            X = X_in
-
-        # -------------------------------------------------
-        # numpy / torch 입력 처리
-        # -------------------------------------------------
-        if isinstance(X, np.ndarray):
-            X_raw_np = X.copy()
-        elif isinstance(X, torch.Tensor):
-            X_raw_np = X.detach().cpu().numpy().copy()
-        else:
-            raise TypeError(f"Unsupported input type: {type(X)}")
-
-        # -------------------------------------------------
-        # shape 정규화
-        # -------------------------------------------------
-        if X_raw_np.ndim == 2:
-            X_raw_np = X_raw_np[None, :, :]
-        elif X_raw_np.ndim == 3 and X_raw_np.shape[0] != 1:
-            raise ValueError(f"예상하지 못한 배치 크기: {X_raw_np.shape[0]}")
-
-        # -------------------------------------------------
-        # current_price fallback
-        # -------------------------------------------------
-        if current_price is None:
-            last_price = getattr(getattr(self, "stockdata", None), "last_price", None)
-            default_price = common_params.get("default_current_price", 100.0)
-            current_price = default_price if last_price is None else float(last_price)
-
-        return X_raw_np, current_price
+    def _safe_float(self, v, default):
+        return float(v) if v is not None else default

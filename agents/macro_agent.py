@@ -14,12 +14,13 @@ import yfinance as yf
 from torch.utils.data import TensorDataset, DataLoader
 
 from config.agents_set import dir_info, agents_info, common_params
+from core.base_classes.base_predict import BaseAgentPredictMixin
 from core.macro_classes.macro_csv_builder import MacroCSVBuilder
 from core.macro_classes.macro_llm import GradientAnalyzer
 from agents.base_agent import BaseAgent, Target, StockData, Opinion, Rebuttal
 from config.prompts import OPINION_PROMPTS, REBUTTAL_PROMPTS, REVISION_PROMPTS
 
-class MacroAgent(BaseAgent, nn.Module):
+class MacroAgent(BaseAgent, nn.Module, BaseAgentPredictMixin):
     """거시경제 데이터를 기반으로 주가를 예측하는 에이전트"""
 
     def __init__(self,
@@ -685,122 +686,3 @@ class MacroAgent(BaseAgent, nn.Module):
 
 
 
-
-    def predict(self, X, n_samples: Optional[int] = None, current_price: Optional[float] = None,):
-        if n_samples is None:
-            n_samples = common_params.get("n_samples", 30)
-
-        if not self.ticker:
-            raise ValueError("ticker가 설정되지 않았습니다. search()를 먼저 호출하세요.")
-
-        # 1. 모델 & 스케일러 보장
-        self._ensure_model_and_scaler()
-
-        # 2. 입력 정규화
-        X_raw_np, current_price = self._prepare_input(X, current_price)
-
-        # 3. 스케일링
-        X_tensor = self._scale_input(X_raw_np)
-
-        # 4. MC Dropout
-        preds = self._run_mc_dropout(X_tensor, n_samples)
-
-        # 5. 후처리
-        mean_pred, std_pred = self._postprocess_prediction(preds)
-
-        # 6. Target 생성
-        return self._build_target(mean_pred, std_pred, current_price)
-    def _ensure_model_and_scaler(self):
-        model_path = os.path.join(self.model_dir, f"{self.ticker}_{self.agent_id}.pt")
-
-        if not os.path.exists(model_path):
-            if not getattr(self, "_in_pretrain", False):
-                self._in_pretrain = True
-                try:
-                    self.pretrain()
-                finally:
-                    self._in_pretrain = False
-            else:
-                raise RuntimeError("pretrain 중 predict 재귀 호출")
-        else:
-            if not getattr(self, "model_loaded", False):
-                self.load_model()
-
-        self.scaler.load(self.ticker)
-    def _prepare_input(self, X, current_price: Optional[float]):
-        if isinstance(X, StockData):
-            sd = X
-            X_in = getattr(sd, self.agent_id, None)
-
-            if isinstance(X_in, dict):
-                feature_cols = sd.feature_cols
-                df = pd.DataFrame({c: X_in.get(c, []) for c in feature_cols})
-                X_in = df.values
-
-            if current_price is None:
-                current_price = sd.last_price
-
-            X = X_in
-
-        if isinstance(X, torch.Tensor):
-            X = X.detach().cpu().numpy()
-        elif not isinstance(X, np.ndarray):
-            raise TypeError(f"Unsupported input type: {type(X)}")
-
-        if X.ndim == 2:
-            X = X[None, :, :]
-
-        if current_price is None:
-            default_price = common_params.get("default_current_price", 100.0)
-            current_price = default_price
-
-        return X, float(current_price)
-    def _scale_input(self, X_raw_np: np.ndarray) -> torch.Tensor:
-        X_scaled, _ = self.scaler.transform(X_raw_np)
-        device = self.device
-        return torch.tensor(X_scaled, dtype=torch.float32).to(device)
-    def _run_mc_dropout(self, X_tensor: torch.Tensor, n_samples: int) -> np.ndarray:
-        self.train()  # dropout 활성화
-        preds = []
-
-        with torch.no_grad():
-            for _ in range(n_samples):
-                out = self(X_tensor)
-                preds.append(out.cpu().numpy().flatten())
-
-        return np.stack(preds)
-    def _postprocess_prediction(self, preds: np.ndarray):
-        mean_pred = preds.mean(axis=0)
-        std_pred = np.abs(preds.std(axis=0))
-
-        if hasattr(self.scaler, "y_scaler") and self.scaler.y_scaler is not None:
-            mean_pred = self.scaler.inverse_y(mean_pred)
-            std_pred = self.scaler.inverse_y(std_pred)
-
-        return mean_pred, std_pred
-    def _build_target(self, mean_pred: np.ndarray, std_pred: np.ndarray, current_price: float,) -> Target:
-        sigma = float(std_pred[-1])
-        sigma = max(sigma, common_params.get("sigma_min", 1e-6))
-
-        confidence = self._calculate_confidence_from_direction_accuracy()
-        if confidence is None:
-            confidence = 0.5
-
-        y_scale_factor = common_params.get("y_scale_factor", 100.0)
-        predicted_return = float(mean_pred[-1]) / y_scale_factor
-
-        cfg = agents_info.get(self.agent_id, {})
-        predicted_return = np.clip(
-            predicted_return,
-            cfg.get("return_clip_min", -0.5),
-            cfg.get("return_clip_max", 0.5),
-        )
-
-        predicted_price = current_price * (1.0 + predicted_return)
-
-        return Target(
-            next_close=float(predicted_price),
-            uncertainty=sigma,
-            confidence=confidence,
-            predicted_return=float(predicted_return),
-        )
