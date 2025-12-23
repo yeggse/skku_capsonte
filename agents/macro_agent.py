@@ -14,6 +14,7 @@ import yfinance as yf
 from torch.utils.data import TensorDataset, DataLoader
 
 from config.agents_set import dir_info, agents_info, common_params
+from core.macro_classes.macro_csv_builder import MacroCSVBuilder
 from core.macro_classes.macro_llm import GradientAnalyzer
 from agents.base_agent import BaseAgent, Target, StockData, Opinion, Rebuttal
 from config.prompts import OPINION_PROMPTS, REBUTTAL_PROMPTS, REVISION_PROMPTS
@@ -100,7 +101,7 @@ class MacroAgent(BaseAgent, nn.Module):
         self.X_raw = None
         self.last_price = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.csv_builder = MacroCSVBuilder(self.agent_id, self.data_dir)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """모델 Forward Pass"""
@@ -120,155 +121,6 @@ class MacroAgent(BaseAgent, nn.Module):
         cfg = agents_info.get(self.agent_id, {})
         return cfg.get("data_cols", [])
 
-    def _ensure_macro_csv(self, ticker: str, rebuild: bool = False) -> None:
-        """거시지표와 주가 데이터를 수집하고 병합하여 Raw CSV로 저장합니다"""
-        csv_path = os.path.join(self.data_dir, f"{ticker}_{self.agent_id}_dataset.csv")
-
-        if not rebuild and os.path.exists(csv_path):
-            return
-
-        print(f"[{self.agent_id}] Raw CSV 생성 중...")
-
-
-        period = common_params.get("period", "2y")
-
-        try:
-            df_macro = yf.download(
-                tickers=list(MACRO_TICKERS.values()),
-                period=period,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-            )
-        except Exception as e:
-            print(f"[WARN] [{self.agent_id}] 매크로 데이터 다운로드 실패: {e}")
-            df_macro = pd.DataFrame()
-
-        if isinstance(df_macro.columns, pd.MultiIndex):
-            df_macro = df_macro.stack(level=0)
-            df_macro.index.names = ["Date", "Ticker"]
-            df_macro = df_macro.unstack(level="Ticker")
-            df_macro.columns = [f"{col[1]}_{col[0]}" for col in df_macro.columns.values]
-        else:
-            df_macro.index.name = "Date"
-
-        df_macro = df_macro.reset_index()
-        if "Date" in df_macro.columns:
-            df_macro["Date"] = pd.to_datetime(df_macro["Date"]).dt.strftime("%Y-%m-%d")
-
-        df_macro_feat = df_macro.copy()
-        if "Date" in df_macro_feat.columns:
-            df_macro_feat.set_index("Date", inplace=True)
-
-        for t in MACRO_TICKERS.values():
-            col_close = f"{t}_Close"
-            if col_close in df_macro_feat.columns:
-                df_macro_feat[f"{t}_ret_1d"] = df_macro_feat[col_close].pct_change()
-
-        if "^TNX_Close" in df_macro_feat.columns and "^IRX_Close" in df_macro_feat.columns:
-            df_macro_feat["Yield_spread"] = df_macro_feat["^TNX_Close"] - df_macro_feat["^IRX_Close"]
-
-        if (
-                "SPY_ret_1d" in df_macro_feat.columns
-                and "DX-Y.NYB_ret_1d" in df_macro_feat.columns
-                and "^VIX_ret_1d" in df_macro_feat.columns
-        ):
-            df_macro_feat["Risk_Sentiment"] = (
-                    df_macro_feat["SPY_ret_1d"] - df_macro_feat["DX-Y.NYB_ret_1d"] - df_macro_feat["^VIX_ret_1d"]
-            )
-
-        df_macro_feat = df_macro_feat.reset_index()
-
-        try:
-            df_price = yf.download(
-                ticker,
-                period=period,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-            )
-            if isinstance(df_price.columns, pd.MultiIndex):
-                df_price.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df_price.columns]
-
-            df_price = df_price[["Close"]].rename(columns={"Close": ticker})
-            df_price.index.name = "Date"
-            df_price = df_price.reset_index()
-            df_price["Date"] = pd.to_datetime(df_price["Date"]).dt.strftime("%Y-%m-%d")
-        except Exception as e:
-            print(f"[WARN] [{self.agent_id}] 종가 데이터 다운로드 실패({ticker}): {e}")
-            df_price = pd.DataFrame(columns=["Date", ticker])
-
-        if not df_price.empty:
-            df_price["ret1"] = df_price[ticker].pct_change()
-            df_price["ma5"] = df_price[ticker].rolling(5).mean()
-            df_price["ma10"] = df_price[ticker].rolling(10).mean()
-            df_price = df_price.fillna(method="bfill")
-
-        if "Date" in df_macro_feat.columns and "Date" in df_price.columns:
-            merged = pd.merge(df_price, df_macro_feat, on="Date", how="inner").sort_values("Date")
-        else:
-            print(f"[WARN] [{self.agent_id}] 'Date' 컬럼 누락으로 병합 실패")
-            merged = pd.DataFrame(columns=["Date"])
-
-        merged = merged.fillna(method="ffill").fillna(method="bfill").dropna().reset_index(drop=True)
-
-        cfg = agents_info.get(self.agent_id, {})
-        feature_cols = cfg.get("data_cols", [])
-        if not feature_cols:
-            raise ValueError(f"[{self.agent_id}] config에 data_cols가 정의되지 않았습니다.")
-        
-        X_final = pd.DataFrame(index=merged.index)
-        for feature in feature_cols:
-            if feature in merged.columns:
-                X_final[feature] = merged[feature]
-            else:
-                X_final[feature] = 0.0
-
-        if ticker in merged.columns:
-            merged["Close"] = merged[ticker]
-        elif "Close" not in merged.columns:
-            merged["Close"] = np.nan
-
-        out_df = pd.concat(
-            [
-                merged[["Date"]].reset_index(drop=True),
-                X_final.reset_index(drop=True),
-                merged[["Close"]].reset_index(drop=True),
-            ],
-            axis=1,
-        )
-
-        out_df["Date"] = pd.to_datetime(out_df["Date"])
-        end_date = pd.Timestamp.today().normalize()
-
-        if period.endswith("y"):
-            years = int(period[:-1])
-            days = years * 365
-        elif period.endswith("m"):
-            months = int(period[:-1])
-            days = months * 30
-        elif period.endswith("d"):
-            days = int(period[:-1])
-        else:
-            days = 2 * 365
-
-        start_date = end_date - pd.Timedelta(days=days)
-
-        out_df = out_df[out_df["Date"] >= start_date].copy()
-        out_df = out_df.sort_values("Date").reset_index(drop=True)
-        out_df["Date"] = out_df["Date"].dt.strftime("%Y-%m-%d")
-
-        os.makedirs(self.data_dir, exist_ok=True)
-        out_df.to_csv(csv_path, index=False)
-
-        base_root = os.path.dirname(self.data_dir)
-        raw_dir = os.path.join(base_root, "raw")
-        os.makedirs(raw_dir, exist_ok=True)
-        raw_path = os.path.join(raw_dir, f"{ticker}_{self.agent_id}_raw.csv")
-        out_df.to_csv(raw_path, index=False)
-
-        print(f"✅ [{self.agent_id}] Raw CSV 저장 완료: {raw_path} ({len(out_df):,} rows, period: {period})")
 
     def search(self, ticker: Optional[str] = None, rebuild: bool = False):
         """데이터를 검색하고 최신 윈도우 텐서를 반환합니다"""
@@ -281,42 +133,33 @@ class MacroAgent(BaseAgent, nn.Module):
         if ticker not in self.tickers:
             self.tickers = [ticker]
 
+        # 모델 / 스케일러 경로 설정 (유지해도 됨)
         self.model_path = os.path.join(self.model_dir, f"{ticker}_{agent_id}.pt")
         scaler_dir = os.path.join(self.model_dir, "scalers")
         self.scaler_X_path = os.path.join(scaler_dir, f"{ticker}_{agent_id}_xscaler.pkl")
         self.scaler_y_path = os.path.join(scaler_dir, f"{ticker}_{agent_id}_yscaler.pkl")
 
-        raw_dir = os.path.join(os.path.dirname(self.data_dir), "raw")
-        raw_csv_path = os.path.join(raw_dir, f"{ticker}_{self.agent_id}_raw.csv")
+        # ----------------------------
+        # CSV 확보 (단일 책임)
+        # ----------------------------
+        csv_path = self.csv_builder.ensure_csv(ticker, rebuild=rebuild)
 
-        if hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date:
+        # 백테스트 override
+        if getattr(self, "test_mode", False) and getattr(self, "simulation_date", None):
+            raw_dir = os.path.join(os.path.dirname(self.data_dir), "raw")
             temp_dir = os.path.join(raw_dir, "backtest_temp")
             date_str = self.simulation_date.replace("-", "")
-            temp_path = os.path.join(temp_dir, f"{ticker}_{self.agent_id}_raw_{date_str}.csv")
+            temp_path = os.path.join(
+                temp_dir, f"{ticker}_{self.agent_id}_raw_{date_str}.csv"
+            )
             if os.path.exists(temp_path):
-                raw_csv_path = temp_path
-                print(f"[INFO] 백테스팅 모드: 필터링된 데이터셋 사용 ({self.simulation_date} 이전)")
+                csv_path = temp_path
+                print(f"[INFO] 백테스팅 모드: {self.simulation_date} 이전 데이터 사용")
 
-        need_build = rebuild or (not os.path.exists(raw_csv_path))
-
-        if need_build:
-            if not os.path.exists(raw_csv_path):
-                print(f"[{agent_id}] Raw CSV 파일이 없어 생성 중...")
-            else:
-                print(f"[{agent_id}] Rebuild 요청됨. Raw CSV 재생성 중...")
-            self._ensure_macro_csv(ticker, rebuild=rebuild)
-
-            if hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date:
-                temp_dir = os.path.join(raw_dir, "backtest_temp")
-                date_str = self.simulation_date.replace("-", "")
-                temp_path = os.path.join(temp_dir, f"{ticker}_{self.agent_id}_raw_{date_str}.csv")
-                if os.path.exists(temp_path):
-                    raw_csv_path = temp_path
-
-        if not os.path.exists(raw_csv_path):
-            raise FileNotFoundError(f"Raw CSV not found: {raw_csv_path}")
-
-        df_raw = pd.read_csv(raw_csv_path)
+        # ----------------------------
+        # CSV 로드
+        # ----------------------------
+        df_raw = pd.read_csv(csv_path)
         df_raw["Date"] = pd.to_datetime(df_raw["Date"])
         df_raw = df_raw.sort_values("Date").reset_index(drop=True)
 
@@ -324,25 +167,28 @@ class MacroAgent(BaseAgent, nn.Module):
         feature_cols = cfg.get("data_cols", [])
         if not feature_cols:
             raise ValueError(f"[{agent_id}] config에 data_cols가 정의되지 않았습니다.")
-        
-        missing_cols = [col for col in feature_cols if col not in df_raw.columns]
-        if missing_cols:
-            print(f"[WARN] [{agent_id}] 누락된 feature {len(missing_cols)}개를 0.0으로 채움: {missing_cols[:5]}...")
-            for col in missing_cols:
-                df_raw[col] = 0.0
-        
-        window_size = self.window
 
+        # 누락 feature 보정
+        missing_cols = [c for c in feature_cols if c not in df_raw.columns]
+        if missing_cols:
+            print(f"[WARN] [{agent_id}] 누락된 feature {len(missing_cols)}개 → 0.0 보정")
+            for c in missing_cols:
+                df_raw[c] = 0.0
+
+        window_size = self.window
         X_all = df_raw[feature_cols].values.astype(np.float32)
 
         if len(X_all) < window_size:
-            raise ValueError(f"데이터 길이({len(X_all)}) < 윈도우 크기({window_size})")
+            raise ValueError(f"데이터 길이({len(X_all)}) < 윈도우({window_size})")
 
         self.X_raw = df_raw[feature_cols]
         x_latest = X_all[-window_size:].reshape(1, window_size, -1)
 
         print(f"✅ [{agent_id}] Searcher 완료: 윈도우 shape {x_latest.shape}")
 
+        # ----------------------------
+        # StockData 구성
+        # ----------------------------
         self.stockdata = StockData(ticker=ticker)
         self.stockdata.feature_cols = feature_cols
         self.stockdata.window_size = window_size
@@ -359,8 +205,11 @@ class MacroAgent(BaseAgent, nn.Module):
             self.stockdata.currency = "USD"
 
         df_latest = pd.DataFrame(x_latest[0], columns=feature_cols)
-        feature_dict = {col: df_latest[col].tolist() for col in df_latest.columns}
-        setattr(self.stockdata, agent_id, feature_dict)
+        setattr(
+            self.stockdata,
+            agent_id,
+            {c: df_latest[c].tolist() for c in feature_cols},
+        )
 
         return torch.tensor(x_latest, dtype=torch.float32)
 
