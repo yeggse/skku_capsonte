@@ -16,10 +16,6 @@ from agents.base_agent import (
     BaseAgent, StockData, Target, Opinion, Rebuttal
 )
 
-from core.technical_classes.technical_data_set import (
-    load_dataset as load_dataset_tech,
-)
-
 from config.agents_set import agents_info, dir_info, common_params
 from config.prompts import OPINION_PROMPTS, REBUTTAL_PROMPTS, REVISION_PROMPTS
 
@@ -94,7 +90,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
         self._last_attn = w.detach()
         ctx = (h2 * w.unsqueeze(-1)).sum(dim=1)
         return self.fc(ctx)
-    
+
     def _validate_feature_names(self, feature_columns: List[str], num_features: int) -> List[str]:
         """피처 이름 리스트를 모델 입력 차원에 맞춰 보정합니다"""
         cols = list(feature_columns) if feature_columns else []
@@ -629,144 +625,152 @@ class TechnicalAgent(BaseAgent, nn.Module):
         out = out.reindex(columns=tech_cols).astype(np.float32)
         return out
 
+
+
+
+
+
+
     def search(self, ticker: Optional[str] = None, rebuild: bool = False):
-        """데이터를 수집하고 최신 윈도우 텐서를 반환합니다"""
         agent_id = self.agent_id
-        ticker = ticker or self.ticker
-        self.ticker = ticker
-        
+        self.ticker = ticker or self.ticker
+        if not self.ticker:
+            raise ValueError("ticker가 지정되지 않았습니다.")
+
+        raw_csv_path = self._resolve_raw_csv_path()
+
+        if rebuild or not os.path.exists(raw_csv_path):
+            self._ensure_raw_csv(raw_csv_path)
+
+        df_raw = self._load_raw_csv(raw_csv_path)
+        df_raw = self._validate_feature_columns(df_raw)
+
+        x_latest, dates = self._build_latest_window(df_raw)
+        self._build_stockdata(df_raw, x_latest, dates)
+
+        print(f"✅ [{agent_id}] Searcher 완료: 윈도우 shape {x_latest.shape}")
+        return torch.tensor(x_latest, dtype=torch.float32)
+
+
+    def _resolve_raw_csv_path(self) -> str:
         raw_dir = os.path.join(os.path.dirname(self.data_dir), "raw")
-        raw_csv_path = os.path.join(raw_dir, f"{ticker}_{agent_id}_raw.csv")
-        
-        if hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date:
+        os.makedirs(raw_dir, exist_ok=True)
+
+        base_path = os.path.join(raw_dir, f"{self.ticker}_{self.agent_id}_raw.csv")
+
+        if getattr(self, "test_mode", False) and getattr(self, "simulation_date", None):
             temp_dir = os.path.join(raw_dir, "backtest_temp")
             date_str = self.simulation_date.replace("-", "")
-            temp_path = os.path.join(temp_dir, f"{ticker}_{agent_id}_raw_{date_str}.csv")
+            temp_path = os.path.join(temp_dir, f"{self.ticker}_{self.agent_id}_raw_{date_str}.csv")
             if os.path.exists(temp_path):
-                raw_csv_path = temp_path
-                print(f"[INFO] 백테스팅 모드: 필터링된 데이터셋 사용 ({self.simulation_date} 이전)")
-        
-        cfg = agents_info.get(agent_id, {})
-        base_period = common_params.get("period", "2y")
-        
-        if base_period.endswith("y"):
-            years = int(base_period[:-1])
-            period_to_use = f"{years + 1}y"
-        elif base_period.endswith("m"):
-            months = int(base_period[:-1])
-            period_to_use = f"{months + 12}m"
-        else:
-            period_to_use = base_period
-        interval_to_use = cfg.get("interval", "1d")
+                print(f"[INFO] 백테스트 모드: {self.simulation_date} 이전 데이터 사용")
+                return temp_path
 
-        need_build = rebuild or (not os.path.exists(raw_csv_path))
-        if need_build:
-            is_backtest = hasattr(self, 'test_mode') and self.test_mode
-            if not is_backtest or not os.path.exists(raw_csv_path):
-                if not os.path.exists(raw_csv_path):
-                    print(f"[{agent_id}] Raw CSV 파일이 없어 생성 중...")
-                else:
-                    print(f"[{agent_id}] Rebuild 요청됨. Raw CSV 재생성 중...")
-                
-                df = self._fetch_ticker_data(ticker, period_to_use, interval_to_use)
-                feat = self._build_features_technical(df[["Open", "High", "Low", "Close", "Volume"]])
-                end_date = pd.Timestamp.today().normalize()
-                if base_period.endswith("y"):
-                    days = int(base_period[:-1]) * 365
-                elif base_period.endswith("m"):
-                    days = int(base_period[:-1]) * 30
-                elif base_period.endswith("d"):
-                    days = int(base_period[:-1])
-                else:
-                    days = 2 * 365
-                start_date = end_date - pd.Timedelta(days=days)
-                
-                try:
-                    os.makedirs(os.path.dirname(raw_csv_path), exist_ok=True)
-                    raw_tech = feat.copy()
-                    raw_tech.index.name = "Date"
-                    raw_tech.reset_index(inplace=True)
-                    
-                    raw_tech["Date"] = pd.to_datetime(raw_tech["Date"])
-                    raw_tech = raw_tech[raw_tech["Date"] >= start_date].copy()
-                    raw_tech = raw_tech.sort_values("Date").reset_index(drop=True)
-                    
-                    if "ticker" not in raw_tech.columns:
-                        raw_tech.insert(1, "ticker", ticker)
-                    
-                    close_df = df[["Close"]].copy()
-                    close_df.index.name = "Date"
-                    close_df.reset_index(inplace=True)
-                    close_df["Date"] = pd.to_datetime(close_df["Date"])
-                    close_df = close_df[close_df["Date"] >= start_date].copy()
-                    close_df = close_df.sort_values("Date").reset_index(drop=True)
-                    
-                    raw_tech["Date"] = raw_tech["Date"].dt.strftime("%Y-%m-%d")
-                    close_df["Date"] = close_df["Date"].dt.strftime("%Y-%m-%d")
-                    raw_tech = raw_tech.merge(close_df, on="Date", how="left")
-                    
-                    if "Close" in raw_tech.columns:
-                        cols = [c for c in raw_tech.columns if c != "Close"] + ["Close"]
-                        raw_tech = raw_tech[cols]
-                    
-                    raw_tech.to_csv(raw_csv_path, index=False)
-                    print(f"✅ [{agent_id}] Raw CSV 저장 완료: {raw_csv_path} ({len(raw_tech):,} rows)")
-                except Exception as e:
-                    print(f"❌ [{agent_id}] Raw CSV 저장 실패: {e}")
-        
-        if not os.path.exists(raw_csv_path):
-            raise FileNotFoundError(f"Raw CSV not found: {raw_csv_path}")
-        
-        df_raw = pd.read_csv(raw_csv_path)
-        df_raw["Date"] = pd.to_datetime(df_raw["Date"])
-        df_raw = df_raw.sort_values("Date").reset_index(drop=True)
-        
+        return base_path
+
+
+    def _ensure_raw_csv(self, raw_csv_path: str):
+        print(f"[{self.agent_id}] Raw CSV 생성 중...")
+        cfg = agents_info.get(self.agent_id, {})
+        interval = cfg.get("interval", "1d")
+
+        period = common_params.get("period", "2y")
+        df_price = self._fetch_ticker_data(self.ticker, period, interval)
+
+        feat_df = self._build_features_technical(
+            df_price[["Open", "High", "Low", "Close", "Volume"]]
+        )
+
+        self._save_raw_csv(df_price, feat_df, raw_csv_path)
+
+    def _save_raw_csv(self, df_price: pd.DataFrame, feat_df: pd.DataFrame, path: str):
+        df = feat_df.copy()
+        df.index.name = "Date"
+        df.reset_index(inplace=True)
+
+        close_df = df_price[["Close"]].copy()
+        close_df.index.name = "Date"
+        close_df.reset_index(inplace=True)
+
+        df["Date"] = pd.to_datetime(df["Date"])
+        close_df["Date"] = pd.to_datetime(close_df["Date"])
+
+        df = df.merge(close_df, on="Date", how="left")
+        df["ticker"] = self.ticker
+
+        df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_csv(path, index=False)
+
+        print(f"✅ Raw CSV 저장 완료: {path} ({len(df):,} rows)")
+
+
+    def _load_raw_csv(self, path: str) -> pd.DataFrame:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Raw CSV not found: {path}")
+
+        df = pd.read_csv(path)
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df.sort_values("Date").reset_index(drop=True)
+
+    def _validate_feature_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        cfg = agents_info.get(self.agent_id, {})
         feature_cols = cfg.get("data_cols", [])
+
         if not feature_cols:
-            raise ValueError(f"[{agent_id}] config에 data_cols가 정의되지 않았습니다.")
-        
-        missing_cols = [col for col in feature_cols if col not in df_raw.columns]
-        if missing_cols:
-            print(f"[WARN] [{agent_id}] 누락된 feature {len(missing_cols)}개를 0.0으로 채움: {missing_cols[:5]}...")
-            for col in missing_cols:
-                df_raw[col] = 0.0
-        
+            raise ValueError(f"[{self.agent_id}] config에 data_cols가 정의되지 않았습니다.")
+
+        missing = [c for c in feature_cols if c not in df.columns]
+        if missing:
+            print(f"[WARN] 누락된 feature {len(missing)}개 → 0.0으로 보정")
+            for c in missing:
+                df[c] = 0.0
+
+        return df
+
+    def _build_latest_window(self, df: pd.DataFrame):
+        cfg = agents_info[self.agent_id]
         window_size = cfg["window_size"]
-        
-        X_all = df_raw[feature_cols].values.astype(np.float32)
-        
+        feature_cols = cfg["data_cols"]
+
+        X_all = df[feature_cols].values.astype(np.float32)
         if len(X_all) < window_size:
-            raise ValueError(f"데이터 길이({len(X_all)}) < 윈도우 크기({window_size})")
-        
+            raise ValueError("데이터 길이가 window_size보다 짧습니다.")
+
         x_latest = X_all[-window_size:].reshape(1, window_size, -1)
-        print(f"✅ [{agent_id}] Searcher 완료: 윈도우 shape {x_latest.shape}")
-        
-        dates_all = df_raw["Date"].values[-window_size:].tolist()
-        dates_all = [[str(d) for d in dates_all]]
+        dates = df["Date"].iloc[-window_size:].astype(str).tolist()
+        return x_latest, dates
 
-        self.stockdata = StockData(ticker=ticker)
-        self.stockdata.feature_cols = feature_cols
-        self.stockdata.window_size = window_size
-        
-        try:
-            self.stockdata.last_price = float(df_raw["Close"].iloc[-1])
-        except Exception:
-            self.stockdata.last_price = None
+
+    def _build_stockdata(self, df: pd.DataFrame, x_latest: np.ndarray, dates: list):
+        sd = StockData(ticker=self.ticker)
+        sd.feature_cols = agents_info[self.agent_id]["data_cols"]
+        sd.window_size = len(dates)
+        sd.last_price = float(df["Close"].iloc[-1]) if "Close" in df.columns else None
 
         try:
-            self.stockdata.currency = yf.Ticker(ticker).info.get("currency", "USD")
+            sd.currency = yf.Ticker(self.ticker).info.get("currency", "USD")
         except Exception:
-            self.stockdata.currency = "USD"
+            sd.currency = "USD"
 
-        df_latest = pd.DataFrame(x_latest[0], columns=feature_cols)
-        feature_dict = {col: df_latest[col].tolist() for col in df_latest.columns}
-        setattr(self.stockdata, agent_id, feature_dict)
-        
-        last_dates = dates_all[0] if dates_all else []
-        setattr(self.stockdata, f"{agent_id}_dates_all", dates_all or [])
-        setattr(self.stockdata, f"{agent_id}_dates", last_dates or [])
+        df_latest = pd.DataFrame(x_latest[0], columns=sd.feature_cols)
+        setattr(sd, self.agent_id, {c: df_latest[c].tolist() for c in df_latest.columns})
+        setattr(sd, f"{self.agent_id}_dates", dates)
 
-        return torch.tensor(x_latest, dtype=torch.float32)
+        self.stockdata = sd
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def pretrain(self):
         """TechnicalAgent 사전학습"""
@@ -1257,7 +1261,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
         if ticker is None:
             ticker = self.ticker
 
-        X, y, feature_cols, _ = load_dataset_tech(
+        X, y, feature_cols, _ = load_dataset(
             ticker,
             agent_id=self.agent_id,
             save_dir=self.data_dir
