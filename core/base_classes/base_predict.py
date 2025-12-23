@@ -1,6 +1,5 @@
 from typing import Optional
 import torch
-import numpy as np
 
 from agents.base_agent import Target, StockData
 from config.agents_set import common_params
@@ -8,13 +7,7 @@ from config.agents_set import common_params
 
 class BaseAgentPredictMixin:
 
-    def predict(
-            self,
-            input_data=None,
-            *,
-            current_price: Optional[float] = None,
-            return_raw: bool = False,
-    ) -> Target:
+    def predict(self, input_data=None, *, current_price: Optional[float] = None, return_raw: bool = False) -> Target:
 
         # --------------------------------------------------
         # 1. 입력 데이터 준비
@@ -63,27 +56,41 @@ class BaseAgentPredictMixin:
             y_pred_scaled = out.detach().cpu().numpy().reshape(-1)
 
         # --------------------------------------------------
-        # 5. 역스케일링 (수익률)
+        # 5. 역스케일링 (모델 출력)
         # --------------------------------------------------
         if hasattr(self, "scaler") and getattr(self.scaler, "y_scaler", None) is not None:
             try:
-                y_pred_scaled = self.scaler.inverse_y(y_pred_scaled)
+                y_pred = self.scaler.inverse_y(y_pred_scaled)
             except Exception:
-                pass
+                y_pred = y_pred_scaled
+        else:
+            y_pred = y_pred_scaled
 
-        y_scale_factor = common_params.get("y_scale_factor", 100.0)
-        predicted_return = float(y_pred_scaled[0]) / y_scale_factor
+        y_pred = float(y_pred[0])
 
         # --------------------------------------------------
-        # 6. 수익률 → 가격
+        # 6. return / price 분기 (유일한 분기 지점)
         # --------------------------------------------------
+        mode = getattr(self, "predict_mode", "return")
+
         current_price = self._extract_current_price(
             input_data=input_data,
             input_array=X.detach().cpu().numpy(),
             current_price=current_price,
         )
 
-        next_close = current_price * (1.0 + predicted_return)
+        if mode == "price": # SentimentalAgent는 ‘수익률 예측 모델’이 아니라 ‘가격(또는 score) 직접 예측 모델’ 구조
+            # SentimentalAgent
+            next_close = y_pred
+            predicted_return = (next_close / current_price) - 1.0
+        else:
+            # Technical / Macro
+            y_scale_factor = common_params.get("y_scale_factor", 100.0)
+            predicted_return = y_pred / y_scale_factor
+            next_close = current_price * (1.0 + predicted_return)
+
+
+
 
         # --------------------------------------------------
         # 7. confidence (None-safe)

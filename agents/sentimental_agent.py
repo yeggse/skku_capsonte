@@ -66,7 +66,7 @@ class SentimentalAgent(BaseAgent):
                                                     data_dir=self.data_dir,
                                                     news_dir=self.news_dir,
                                                 )
-
+        predict_mode = "price"          # SentimentalAgent는 ‘수익률 예측 모델’이 아니라 ‘가격(또는 score) 직접 예측 모델’ 구조
 
     def pretrain(self):
         """사전학습을 수행합니다"""
