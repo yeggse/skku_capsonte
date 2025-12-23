@@ -23,6 +23,7 @@ from config.agents_set import agents_info
 
 from config.agents_set import common_params
 from core.sentimental_classes.news import update_news_db
+from core.sentimental_classes.sentimental_csv_builder import SentimentalCSVBuilder
 
 CFG_S = agents_info["SentimentalAgent"]
 WINDOW_SIZE = CFG_S["window_size"]
@@ -60,6 +61,11 @@ class SentimentalAgent(BaseAgent):
             raise ValueError("SentimentalAgent: ticker is None/empty")
         self.ticker = str(self.ticker).upper()
         setattr(self, "ticker", self.ticker)
+        self.csv_builder = SentimentalCSVBuilder(
+                                                    agent_id=self.agent_id,
+                                                    data_dir=self.data_dir,
+                                                    news_dir=self.news_dir,
+                                                )
 
 
     def pretrain(self):
@@ -330,9 +336,7 @@ class SentimentalAgent(BaseAgent):
         )
         return model
 
-    # -------------------------------------------------------
     # RUN_DATASET
-    # -------------------------------------------------------
     def run_dataset(self, days: int = None) -> StockData:
         """
         최근 days일치 가격 + 뉴스 피처를 기반으로 StockData를 생성합니다.
@@ -449,9 +453,7 @@ class SentimentalAgent(BaseAgent):
         self.stockdata = sd
         return sd
 
-    # -------------------------------------------------------
     # 내부 헬퍼: _ensure_sentimental_csv
-    # -------------------------------------------------------
     def _ensure_sentimental_csv(self, ticker: str, rebuild: bool = False) -> None:
         """
         SentimentalAgent 전용 CSV 생성 메서드 (뉴스 데이터 수집 및 병합)
@@ -600,106 +602,39 @@ class SentimentalAgent(BaseAgent):
         except Exception as e:
             print(f"❌ [{self.agent_id}] Raw CSV 저장 실패: {e}")
 
-    # -------------------------------------------------------
     # searcher (통일된 CSV 기반 캐싱 패턴)
-    # -------------------------------------------------------
     def search(self, ticker: Optional[str] = None, rebuild: bool = False):
-        """
-        SentimentalAgent 전용 Searcher
-        - 데이터를 수집하고 최신 윈도우 텐서를 반환
-        - 필요 시 CSV 파일 생성 (rebuild)
-        """
-        agent_id = self.agent_id
         ticker = ticker or self.ticker
-        if not ticker:
-            raise ValueError(f"{agent_id}: ticker가 지정되지 않았습니다.")
-        
-        self.ticker = str(ticker).upper()
-        
-        raw_dir = os.path.join(os.path.dirname(self.data_dir), "raw")
-        raw_csv_path = os.path.join(raw_dir, f"{ticker}_{agent_id}_raw.csv")
-        
-        # 백테스팅 모드 처리
-        if hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date:
-            temp_dir = os.path.join(raw_dir, "backtest_temp")
-            date_str = self.simulation_date.replace("-", "")
-            temp_path = os.path.join(temp_dir, f"{ticker}_{agent_id}_raw_{date_str}.csv")
-            if os.path.exists(temp_path):
-                raw_csv_path = temp_path
-                print(f"[INFO] 백테스팅 모드: 필터링된 데이터셋 사용 ({self.simulation_date} 이전)")
-        
-        cfg = agents_info.get(agent_id, {})
-        
-        # Raw CSV 생성 (필요 시)
-        if not (hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date and os.path.exists(raw_csv_path)):
-            self._ensure_sentimental_csv(ticker, rebuild=rebuild)
-        
-        if not os.path.exists(raw_csv_path):
-            raise FileNotFoundError(f"Raw CSV not found: {raw_csv_path}")
-        
-        # 데이터 로드 및 윈도우 추출
-        df_raw = pd.read_csv(raw_csv_path)
-        df_raw["Date"] = pd.to_datetime(df_raw["Date"])
-        df_raw = df_raw.sort_values("Date").reset_index(drop=True)
-        
-        # config에서 feature 목록 가져오기
-        feature_cols = cfg.get("data_cols", [])
-        if not feature_cols:
-            raise ValueError(f"[{agent_id}] config에 data_cols가 정의되지 않았습니다.")
-        
-        # 누락된 feature 확인 및 처리
-        missing_cols = [col for col in feature_cols if col not in df_raw.columns]
-        if missing_cols:
-            print(f"[WARN] [{agent_id}] 누락된 feature {len(missing_cols)}개를 0.0으로 채움: {missing_cols[:5]}...")
-            for col in missing_cols:
-                df_raw[col] = 0.0
-        
-        window_size = cfg.get("window_size", self.window_size)
-        
-        X_all = df_raw[feature_cols].values.astype(np.float32)
-        
+        self.ticker = ticker
+
+        csv_path = self.csv_builder.ensure_csv(ticker, rebuild=rebuild)
+
+        df = pd.read_csv(csv_path)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+
+        cfg = agents_info[self.agent_id]
+        feature_cols = cfg["data_cols"]
+        window_size = cfg["window_size"]
+
+        X_all = df[feature_cols].values.astype("float32")
         if len(X_all) < window_size:
-            raise ValueError(f"데이터 길이({len(X_all)}) < 윈도우 크기({window_size})")
-        
-        x_latest = X_all[-window_size:].reshape(1, window_size, -1)  # (1, T, F)
-        
-        print(f"✅ [{agent_id}] Searcher 완료: 윈도우 shape {x_latest.shape}")
-        
-        # StockData 구성
+            raise ValueError("데이터 부족")
+
+        x_latest = X_all[-window_size:].reshape(1, window_size, -1)
+
         self.stockdata = StockData(ticker=ticker)
         self.stockdata.feature_cols = feature_cols
         self.stockdata.window_size = window_size
-        
-        try:
-            self.stockdata.last_price = float(df_raw["Close"].iloc[-1])
-        except Exception:
-            self.stockdata.last_price = None
-
-        try:
-            self.stockdata.currency = yf.Ticker(ticker).info.get("currency", "USD")
-        except Exception:
-            self.stockdata.currency = "USD"
-
+        self.stockdata.last_price = float(df["Close"].iloc[-1])
         self.stockdata.X_seq = x_latest
-        
-        df_latest = pd.DataFrame(x_latest[0], columns=feature_cols)
-        feature_dict = {col: df_latest[col].tolist() for col in df_latest.columns}
-        setattr(self.stockdata, agent_id, feature_dict)
-        
-        if len(df_raw) > 0:
-            last_row = df_raw.iloc[-1]
-            self.stockdata.news_feats = {
-                "news_count_7d": float(last_row.get("news_count_7d", 0)),
-                "sentiment_mean_7d": float(last_row.get("sentiment_mean_7d", 0)),
-                "sentiment_vol_7d": float(last_row.get("sentiment_vol_7d", 0)),
-            }
-            self.stockdata.raw_df = df_raw
 
         return torch.tensor(x_latest, dtype=torch.float32)
 
-    # -------------------------------------------------------
+
+
+
     # predict
-    # -------------------------------------------------------
     def predict(self, X, n_samples: Optional[int] = None, current_price: Optional[float] = None):
         """
         Monte Carlo Dropout을 이용한 예측 수행
@@ -839,9 +774,7 @@ class SentimentalAgent(BaseAgent):
 
         return target
 
-    # -------------------------------------------------------
     # 내부 helper: _predict_next_close
-    # -------------------------------------------------------
     @torch.inference_mode()
     def _predict_next_close(self) -> Tuple[float, float, float, List[str]]:
         """
@@ -864,9 +797,7 @@ class SentimentalAgent(BaseAgent):
         cols = list(getattr(sd, "feature_cols", self.feature_cols))
         return float(target.next_close), float(target.uncertainty or 0.0), float(target.confidence or 0.0), cols
 
-    # -------------------------------------------------------
     # ctx 구성 (프롬프트용)
-    # -------------------------------------------------------
     def build_ctx(self, asof_date_kst: Optional[str] = None) -> Dict[str, Any]:
         """LLM 프롬프트용 Context 생성"""
         # 0) StockData 확인
@@ -950,9 +881,7 @@ class SentimentalAgent(BaseAgent):
         }
         return ctx
 
-    # -------------------------------------------------------
     # 프롬프트 빌더
-    # -------------------------------------------------------
     def _build_messages_opinion(self, stock_data: StockData, target: Target) -> Tuple[str, str]:
         if stock_data is None:
             stock_data = self.stockdata
@@ -1163,3 +1092,9 @@ class SentimentalAgent(BaseAgent):
             target=target,
             reason=reason,
         )
+
+
+
+
+
+
