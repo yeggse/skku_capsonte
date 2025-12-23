@@ -489,11 +489,41 @@ class TechnicalAgent(BaseAgent, nn.Module, BaseAgentPredictMixin):
         df_raw = self._load_raw_csv(raw_csv_path)
 
         trainer = TechnicalTrainer(self)
-        X, y = trainer.prepare_dataset(df_raw)
+        X, y = trainer.prepare_dataset(df_raw)   # ← 여기서 X, y가 시퀀스
         trainer.fit(X, y)
         trainer.save()
 
         self.model_loaded = True
+
+        # ===============================
+        # dataset.csv 저장 (앙상블용)
+        # ===============================
+        if common_params.get("pretrain_save_dataset", True):
+            dataset_path = os.path.join(
+                self.data_dir,
+                f"{self.ticker}_{self.agent_id}_dataset.csv"
+            )
+
+            rows = []
+            for sample_id in range(len(X)):
+                for t in range(self.window_size):
+                    row = {
+                        "sample_id": sample_id,
+                        "time_step": t,
+                        "target": (
+                            float(y[sample_id])
+                            if t == self.window_size - 1
+                            else np.nan
+                        ),
+                    }
+                    for i, col in enumerate(self.stockdata.feature_cols):
+                        row[col] = float(X[sample_id, t, i])
+                    rows.append(row)
+
+            df_dataset = pd.DataFrame(rows)
+            os.makedirs(self.data_dir, exist_ok=True)
+            df_dataset.to_csv(dataset_path, index=False)
+            print(f"✅ TechnicalAgent dataset 저장 완료: {dataset_path}")
 
     def review_draft(self, stock_data: StockData = None, target: Target = None) -> Opinion:
         """초기 의견을 생성합니다"""
