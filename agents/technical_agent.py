@@ -505,11 +505,19 @@ class TechnicalAgent(BaseAgent, nn.Module, BaseAgentPredictMixin):
             )
 
             rows = []
+            # df_raw는 Date 컬럼을 이미 가지고 있음
+            dates = pd.to_datetime(df_raw["Date"]).dt.normalize().values
+
             for sample_id in range(len(X)):
                 for t in range(self.window_size):
+                    date_idx = sample_id + t
+                    if date_idx >= len(dates):
+                        continue
+
                     row = {
                         "sample_id": sample_id,
                         "time_step": t,
+                        "date": str(dates[date_idx]),
                         "target": (
                             float(y[sample_id])
                             if t == self.window_size - 1

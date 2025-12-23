@@ -569,12 +569,13 @@ class DebateSystem:
                                         if t_idx < 5:
                                             print(f"  [DEBUG] Macro: 피처 컬럼이 없습니다 (날짜: {curr_date_normalized})")
                                     else:
-                                        # 윈도우 데이터 추출 (T, F) 형태 - predict 내부에서 스케일링
                                         X_values = macro_sample[feat_cols].values[-w_macro:]
 
-                                        # predict에 원본 데이터 전달 (내부에서 스케일링 처리)
+                                        # ★ batch 차원 추가 (중요)
+                                        X_values = np.expand_dims(X_values, axis=0)  # (1, w_macro, feature_dim)
                                         macro_agent = self.agents["MacroAgent"]
                                         target_macro = macro_agent.predict(X_values, current_price=curr_close)
+
                                         pred_macro = target_macro.next_close
                                         conf_macro = target_macro.confidence
                                         unc_macro = target_macro.uncertainty

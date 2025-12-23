@@ -1,4 +1,6 @@
 from typing import Optional
+
+import numpy as np
 import torch
 
 from agents.base_agent import Target, StockData
@@ -16,6 +18,9 @@ class BaseAgentPredictMixin:
             X = self.search(self.ticker)
         elif isinstance(input_data, torch.Tensor):
             X = input_data
+        elif isinstance(input_data, np.ndarray):
+            # ★ 앙상블/백테스트용 입력
+            X = torch.tensor(input_data, dtype=torch.float32)
         elif isinstance(input_data, StockData):
             X = self.search(self.ticker)
         else:
