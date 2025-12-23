@@ -3,14 +3,12 @@
 import os
 import json
 from typing import List, Optional, Union
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import yfinance as yf
-from torch.utils.data import DataLoader, TensorDataset
 
 from agents.base_agent import (
     BaseAgent, StockData, Target, Opinion, Rebuttal
@@ -18,11 +16,13 @@ from agents.base_agent import (
 
 from config.agents_set import agents_info, dir_info, common_params
 from config.prompts import OPINION_PROMPTS, REBUTTAL_PROMPTS, REVISION_PROMPTS
-
+from core.technical_classes.technical_explainer import TechnicalExplainer
 from core.technical_classes.technical_data_set import load_dataset
-import shap
 
 import warnings
+
+from core.technical_classes.technical_trainer import TechnicalTrainer
+
 warnings.filterwarnings('ignore')
 
 
@@ -79,6 +79,8 @@ class TechnicalAgent(BaseAgent, nn.Module):
         self.last_attn = None
         self._last_idea = None
 
+        self.explainer = TechnicalExplainer(self)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """모델 Forward Pass"""
         h1, _ = self.lstm1(x)
@@ -114,276 +116,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
         except Exception:
             return X_np
 
-    @torch.no_grad()
-    def time_importance_from_attention(self, X_last: torch.Tensor) -> np.ndarray:
-        """모델의 Time-Attention 가중치를 기반으로 시간 중요도를 계산합니다"""
-        self.eval()
-        _ = self(X_last)
-        attn = getattr(self, "_last_attn", None)
 
-        if attn is None:
-            T = X_last.shape[1]
-            return np.ones(T, dtype=float) / T
-        w = attn[0].abs().cpu().numpy()
-        w = w.flatten() if w.ndim > 1 else w
-        s = w.sum()
-        result = w / s if s > 0 else np.ones_like(w) / len(w)
-        return result.flatten() if result.ndim > 1 else result
-
-    def gradxinput_attrib(self, X_last: torch.Tensor, eps: float = 0.0):
-        """Grad×Input 방식으로 피처 기여도를 산출합니다"""
-        self.eval()
-        x = X_last.clone().detach().to(next(self.parameters()).device)
-
-        if eps > 0:
-            x = x + eps * torch.randn_like(x)
-        x.requires_grad_(True)
-        y = self(x).sum()
-        self.zero_grad(set_to_none=True)
-        y.backward()
-        gi = (x.grad * x).abs()[0].detach().cpu().numpy()
-        per_time = gi.sum(axis=1)
-        per_feat = gi.mean(axis=0)
-        return per_time, per_feat, gi
-
-    @torch.no_grad()
-    def occlusion_time(self, X_last: torch.Tensor, fill: str = "zero", batch: Optional[int] = None):
-        """시간축 Occlusion을 통한 중요도를 계산합니다"""
-        if batch is None:
-            batch = agents_info.get(self.agent_id, {}).get("occlusion_batch_size", 32)
-        self.eval()
-        base = float(self(X_last).item())
-        _, T, F = X_last.shape
-        Xs = []
-        for t in range(T):
-            x = X_last.clone()
-            if fill == "zero":
-                x[:, t, :] = 0
-            else:
-                x[:, t, :] = X_last.mean(dim=1, keepdim=True)[:, 0, :]
-            Xs.append(x)
-        deltas = []
-        for i in range(0, T, batch):
-            xb = torch.cat(Xs[i:i+batch], dim=0)
-            yb = self(xb).flatten().cpu().numpy()
-            deltas.extend(np.abs(yb - base).tolist())
-        s = sum(deltas)
-        return np.array([v/s if s > 0 else 1.0/T for v in deltas], dtype=float)
-
-    @torch.no_grad()
-    def occlusion_feature(self, X_last: torch.Tensor, fill: str = "zero", batch: Optional[int] = None):
-        """피처축 Occlusion을 통한 중요도를 계산합니다"""
-        if batch is None:
-            batch = agents_info.get(self.agent_id, {}).get("occlusion_batch_size", 32)
-        self.eval()
-        base = float(self(X_last).item())
-        _, T, F = X_last.shape
-        Xs = []
-        for f in range(F):
-            x = X_last.clone()
-            if fill == "zero":
-                x[:, :, f] = 0
-            else:
-                x[:, :, f] = X_last.mean(dim=(1, 2), keepdim=True)[:, 0, 0]
-            Xs.append(x)
-        deltas = []
-        for i in range(0, F, batch):
-            xb = torch.cat(Xs[i:i+batch], dim=0)
-            yb = self(xb).flatten().cpu().numpy()
-            deltas.extend(np.abs(yb - base).tolist())
-        s = sum(deltas)
-        return np.array([v/s if s > 0 else 1.0/F for v in deltas], dtype=float)
-
-    def explain_last(
-        self,
-        X_last: torch.Tensor,
-        dates: list | None = None,
-        top_k: Optional[int] = None,
-        use_shap: bool = True,
-        shap_weight_time: Optional[float] = None,
-        shap_weight_feat: Optional[float] = None
-        ):
-        """최신 윈도우에 대한 설명 패킷을 생성합니다"""
-        cfg = agents_info.get(self.agent_id, {})
-        if top_k is None:
-            top_k = cfg.get("top_k_features", 5)
-        if shap_weight_time is None:
-            shap_weight_time = cfg.get("shap_weight_time", 0.20)
-        if shap_weight_feat is None:
-            shap_weight_feat = cfg.get("shap_weight_feat", 0.30)
-        
-        device = next(self.parameters()).device
-        X_np = X_last.detach().cpu().numpy()
-        X_scaled = self._scale_like_train(X_np)
-        Xs = torch.tensor(X_scaled, dtype=torch.float32, device=device)
-
-        T, F = Xs.shape[1], Xs.shape[2]
-        feat_cols_src = getattr(self.stockdata, "feature_cols", [])
-        feat_names = self._validate_feature_names(feat_cols_src, F)
-        if dates is None:
-            dates = getattr(self.stockdata, f"{self.agent_id}_dates", [])
-        dates = self._validate_dates(dates, T)
-
-        # 1. 시간 중요도 (Attention)
-        time_attn = self.time_importance_from_attention(Xs)
-
-        # 2. Grad×Input
-        g_time, g_feat, gi_raw = self.gradxinput_attrib(Xs, eps=0.0)
-
-        # 3. Occlusion
-        occlusion_batch = cfg.get("occlusion_batch_size", 32)
-        occ_time = self.occlusion_time(Xs, fill="zero", batch=occlusion_batch)
-        occ_feat = self.occlusion_feature(Xs, fill="zero", batch=occlusion_batch)
-
-        # 정규화
-        g_time_n = g_time / (g_time.sum() + 1e-12)
-        g_feat_n = g_feat / (g_feat.sum() + 1e-12)
-        occ_feat_n = occ_feat / (occ_feat.sum() + 1e-12)
-
-        # 4. SHAP (옵션)
-        shap_time = None
-        shap_feat = None
-        shap_used = False
-        if use_shap:
-            try:
-                shap_res = self.shap_last(Xs, background_k=64)
-                shap_time = shap_res["per_time"]
-                shap_feat = shap_res["per_feature"]
-                shap_used = True
-            except Exception:
-                shap_time = None
-                shap_feat = None
-                shap_used = False
-
-        attention_weights = cfg.get("attention_weights", [0.4, 0.25, 0.15])
-        feature_weights = cfg.get("feature_weights", [0.5, 0.2])
-        
-        if shap_time is not None and shap_feat is not None:
-            w_time = np.array([attention_weights[0], attention_weights[1], attention_weights[2], float(shap_weight_time)], dtype=float)
-            w_time = w_time / w_time.sum()
-            per_time = (
-                w_time[0]*time_attn +
-                w_time[1]*g_time_n +
-                w_time[2]*occ_time +
-                w_time[3]*shap_time
-            )
-            w_feat = np.array([feature_weights[0], feature_weights[1], float(shap_weight_feat)], dtype=float)
-            w_feat = w_feat / w_feat.sum()
-            per_feat = (
-                w_feat[0]*g_feat_n +
-                w_feat[1]*occ_feat_n +
-                w_feat[2]*shap_feat
-            )
-        else:
-            per_time = attention_weights[0] * time_attn + attention_weights[1] * g_time_n + attention_weights[2] * occ_time
-            per_feat = feature_weights[0] * g_feat_n + feature_weights[1] * occ_feat_n
-
-        per_time = per_time.flatten() if per_time.ndim > 1 else per_time
-        per_feat = per_feat.flatten() if per_feat.ndim > 1 else per_feat
-
-        gi_abs = np.abs(gi_raw)
-        time_feature = {}
-        for t_idx, d in enumerate(dates):
-            pairs = sorted(
-                zip(feat_names, gi_abs[t_idx].tolist()),
-                key=lambda z: z[1], reverse=True
-            )[:top_k]
-            time_feature[str(d)] = {k: float(v) for k, v in pairs}
-
-        time_attention = {str(d): round_num(w) for d, w in zip(dates, time_attn.tolist())}
-        per_time_list = [{"date": str(d), "sum_abs": round_num(v)} for d, v in zip(dates, per_time.tolist())]
-        per_feat_list = [{"feature": k, "sum_abs": round_num(v)} for k, v in sorted(zip(feat_names, per_feat.tolist()), key=lambda z: z[1], reverse=True)]
-
-        evidence = {
-            "attention": [round_num(x) for x in time_attn.tolist()],
-            "gradxinput_feat": [round_num(x) for x in g_feat.tolist()],
-            "occlusion_time": [round_num(x) for x in occ_time.tolist()],
-            "window_size": int(T),
-            "shap_used": bool(shap_used)
-            }
-
-        return {
-            "per_time": per_time_list,
-            "per_feature": per_feat_list,
-            "time_attention": time_attention,
-            "time_feature": time_feature,
-            "evidence": evidence,
-            "raw": {"gradxinput": gi_abs.tolist()}
-          }
-
-    def _background_windows(self, k: int = 64):
-        """SHAP 계산을 위한 배경 데이터를 샘플링합니다"""
-        try:
-            X, _, _, _ = load_dataset(self.ticker, agent_id=self.agent_id, save_dir=self.data_dir)
-            if len(X) <= 1:
-                return None
-            k = min(int(k), len(X) - 1)
-            idx = np.linspace(0, len(X) - 2, num=k, dtype=int)
-            X_bg = X[idx]
-            X_bg_scaled, _ = self.scaler.transform(X_bg)
-            dev = next(self.parameters()).device
-            return torch.tensor(X_bg_scaled, dtype=torch.float32, device=dev)
-        except Exception:
-            return None
-
-    def shap_last(self, X_last: torch.Tensor, background_k: int = 64):
-        """SHAP 값을 계산합니다"""
-
-        self.eval()
-        X_bg = self._background_windows(k=background_k)
-        if X_bg is None:
-            X_bg = X_last.repeat(32, 1, 1)
-
-        X_np = X_last.detach().cpu().numpy()
-        X_scaled = self._scale_like_train(X_np)
-        X_in = torch.tensor(X_scaled, dtype=torch.float32, device=next(self.parameters()).device)
-        X_in.requires_grad_(True)
-
-        explainer = shap.GradientExplainer(self, X_bg)
-        sv = explainer.shap_values(X_in)
-
-        if isinstance(sv, list):
-            sv = sv[0]
-        if sv.ndim == 2:
-            sv = sv[None, ...]
-
-        sv_abs = np.abs(sv)
-        per_time = sv_abs.sum(axis=2)[0]
-        per_feat = sv_abs.mean(axis=1)[0]
-
-        per_time = per_time / (per_time.sum() + 1e-12)
-        per_feat = per_feat / (per_feat.sum() + 1e-12)
-        return {"per_time": per_time, "per_feature": per_feat}
-
-    @staticmethod
-    def _summarize_analysis(explanation: dict, top_time_periods: Optional[int] = None, top_features: Optional[int] = None, coverage: Optional[float] = None):
-        """설명 결과를 LLM 프롬프트용으로 요약합니다"""
-        agent_id = explanation.get("evidence", {}).get("agent_id", "TechnicalAgent")
-        cfg = agents_info.get(agent_id, {})
-        if top_time_periods is None:
-            top_time_periods = cfg.get("pack_idea_top_time", 8)
-        if top_features is None:
-            top_features = cfg.get("pack_idea_top_feat", 6)
-        if coverage is None:
-            coverage = cfg.get("pack_idea_coverage", 0.8)
-        
-        per_time = sorted(explanation["per_time"], key=lambda z: z["sum_abs"], reverse=True)
-        total = sum(z["sum_abs"] for z in per_time) or 1.0
-        acc, picked = 0.0, []
-        for z in per_time:
-            acc += z["sum_abs"]
-            picked.append({"date": z["date"], "weight": round_num(z["sum_abs"]/total)})
-            if acc/total >= coverage or len(picked) >= top_time_periods:
-                break
-
-        per_feat = sorted(explanation["per_feature"], key=lambda z: z["sum_abs"], reverse=True)[:top_features]
-        top_features_list = [{"feature": f["feature"], "weight": round_num(f["sum_abs"])} for f in per_feat]
-        peak = picked[0]["date"] if picked else None
-        return {
-            "top_time": picked,
-            "top_features": top_features_list,
-            "peak_date": peak,
-            "window_size": explanation.get("evidence",{}).get("window_size")}
 
     def _build_messages_opinion(self, stock_data, target):
         """Opinion 생성용 프롬프트 메시지를 구성합니다"""
@@ -405,9 +138,17 @@ class TechnicalAgent(BaseAgent, nn.Module):
         dates = getattr(self.stockdata, f"{self.agent_id}_dates", [])
         cfg = agents_info.get(self.agent_id, {})
         top_k = cfg.get("top_k_features", 5)
-        
-        exp = self.explain_last(X_last, dates, top_k=top_k, use_shap=True)
-        idea = self._summarize_analysis(exp)
+
+
+        exp = self.explainer.explain(
+            X_last=X_last,
+            dates=dates,
+            feature_names=self.stockdata.feature_cols,
+            top_k=top_k,
+            use_shap=True
+        )
+
+        idea = self.explainer.summarize(exp)
         self._last_idea = idea
 
         ctx = {
@@ -651,7 +392,6 @@ class TechnicalAgent(BaseAgent, nn.Module):
         print(f"✅ [{agent_id}] Searcher 완료: 윈도우 shape {x_latest.shape}")
         return torch.tensor(x_latest, dtype=torch.float32)
 
-
     def _resolve_raw_csv_path(self) -> str:
         raw_dir = os.path.join(os.path.dirname(self.data_dir), "raw")
         os.makedirs(raw_dir, exist_ok=True)
@@ -667,7 +407,6 @@ class TechnicalAgent(BaseAgent, nn.Module):
                 return temp_path
 
         return base_path
-
 
     def _ensure_raw_csv(self, raw_csv_path: str):
         print(f"[{self.agent_id}] Raw CSV 생성 중...")
@@ -703,7 +442,6 @@ class TechnicalAgent(BaseAgent, nn.Module):
         df.to_csv(path, index=False)
 
         print(f"✅ Raw CSV 저장 완료: {path} ({len(df):,} rows)")
-
 
     def _load_raw_csv(self, path: str) -> pd.DataFrame:
         if not os.path.exists(path):
@@ -741,7 +479,6 @@ class TechnicalAgent(BaseAgent, nn.Module):
         dates = df["Date"].iloc[-window_size:].astype(str).tolist()
         return x_latest, dates
 
-
     def _build_stockdata(self, df: pd.DataFrame, x_latest: np.ndarray, dates: list):
         sd = StockData(ticker=self.ticker)
         sd.feature_cols = agents_info[self.agent_id]["data_cols"]
@@ -761,245 +498,29 @@ class TechnicalAgent(BaseAgent, nn.Module):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
     def pretrain(self):
-        """TechnicalAgent 사전학습"""
-        epochs = agents_info[self.agent_id]["epochs"]
-        lr = agents_info[self.agent_id]["learning_rate"]
-        batch_size = agents_info[self.agent_id]["batch_size"]
-        
         if not self.ticker:
-            raise ValueError("TechnicalAgent.pretrain: ticker가 설정되지 않았습니다.")
-        
-        ticker = self.ticker
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Pretraining {self.agent_id}")
-        
-        raw_dir = os.path.join(os.path.dirname(self.data_dir), "raw")
-        raw_csv_path = os.path.join(raw_dir, f"{ticker}_{self.agent_id}_raw.csv")
-        
-        if hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date:
-            temp_dir = os.path.join(raw_dir, "backtest_temp")
-            date_str = self.simulation_date.replace("-", "")
-            temp_path = os.path.join(temp_dir, f"{ticker}_{self.agent_id}_raw_{date_str}.csv")
-            if os.path.exists(temp_path):
-                raw_csv_path = temp_path
-                print(f"[INFO] 백테스팅 모드: 필터링된 데이터셋 사용 ({self.simulation_date} 이전)")
-        
-        if not os.path.exists(raw_csv_path):
-            print(f"[{self.agent_id}] Raw CSV 파일이 없어 searcher() 실행 중...")
-            _ = self.search(ticker, rebuild=True)
-            raw_csv_path = os.path.join(raw_dir, f"{ticker}_{self.agent_id}_raw.csv")
-            if not os.path.exists(raw_csv_path):
-                raise FileNotFoundError(f"Raw CSV not found after searcher: {raw_csv_path}")
-        
-        df_raw = pd.read_csv(raw_csv_path)
-        df_raw["Date"] = pd.to_datetime(df_raw["Date"])
-        df_raw = df_raw.sort_values("Date").reset_index(drop=True)
-        
-        cfg = agents_info.get(self.agent_id, {})
-        feature_cols = cfg.get("data_cols", [])
-        if not feature_cols:
-            raise ValueError(f"[{self.agent_id}] config에 data_cols가 정의되지 않았습니다.")
-        
-        missing_cols = [col for col in feature_cols if col not in df_raw.columns]
-        if missing_cols:
-            print(f"[WARN] [{self.agent_id}] 누락된 feature {len(missing_cols)}개를 0.0으로 채움: {missing_cols[:5]}...")
-            for col in missing_cols:
-                df_raw[col] = 0.0
-        
-        X_all = df_raw[feature_cols].values.astype(np.float32)
-        close_prices = df_raw["Close"].values
-        y_all = (close_prices[1:] / close_prices[:-1] - 1.0).reshape(-1, 1).astype(np.float32)
-        X_all = X_all[:-1]
-        
-        if hasattr(self, 'test_mode') and self.test_mode and hasattr(self, 'simulation_date') and self.simulation_date:
-            if len(y_all) > 0:
-                y_all = y_all[:-1]
-                X_all = X_all[:-1]
-                print(f"[INFO] 백테스팅 모드: {self.simulation_date} 이전 데이터 사용 중, 마지막 타겟 제거")
-        
-        window_size = self.window_size
-        if len(X_all) < window_size:
-            raise ValueError(f"데이터 길이({len(X_all)}) < 윈도우 크기({window_size})")
-        
-        X_seq, y_seq = self._create_sequences(X_all, y_all, window_size)
-        print(f"[INFO] 시퀀스 생성 완료: {X_seq.shape}, {y_seq.shape}")
-        
-        y_scale_factor = common_params.get("y_scale_factor", 100.0)
-        y_seq = y_seq * y_scale_factor
-        
-        self.scaler.fit_scalers(X_seq, y_seq)
-        self.scaler.save(ticker)
-        
-        X_train, y_train = map(torch.tensor, self.scaler.transform(X_seq, y_seq))
-        X_train, y_train = X_train.float(), y_train.float()
-        
-        model = self
-        self._modules.pop("model", None)
-        
-        # GPU 사용 가능 시 GPU로 이동
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(device)
-        X_train = X_train.to(device)
-        y_train = y_train.to(device)
-        
-        model.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        
-        loss_fn_name = cfg.get("loss_fn", "HuberLoss")
-        if loss_fn_name == "HuberLoss":
-            huber_delta = common_params.get("huber_loss_delta", 1.0)
-            loss_fn = torch.nn.HuberLoss(delta=huber_delta)
-        else:
-            loss_fn = torch.nn.HuberLoss()
-        
-        shuffle = cfg.get("shuffle", True)
-        early_stopping_enabled = common_params.get("early_stopping_enabled", True)
-        patience = cfg.get("patience", 20)
-        min_delta = common_params.get("early_stopping_min_delta", 1e-6)
-        eval_split_ratio = common_params.get("eval_split_ratio", 0.8)
-        
-        if early_stopping_enabled:
-            split_idx = int(len(X_train) * eval_split_ratio)
-            X_train_split = X_train[:split_idx]
-            X_val_split = X_train[split_idx:]
-            y_train_split = y_train[:split_idx]
-            y_val_split = y_train[split_idx:]
-            
-            val_dataset = TensorDataset(X_val_split, y_val_split.view(-1, 1))
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        else:
-            X_train_split = X_train
-            y_train_split = y_train
-        
-        train_dataset = TensorDataset(X_train_split, y_train_split.view(-1, 1))
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle)
-        
-        log_interval = common_params.get("pretrain_log_interval", 5)
-        final_loss = None
-        y_scale_factor = common_params.get("y_scale_factor", 100.0)
-        
-        # Early Stopping 변수 초기화
-        best_val_loss_orig = float('inf')
-        patience_counter = 0
-        best_model_state = None
-        
-        for epoch in range(epochs):
-            total_loss = 0.0
-            total_loss_original = 0.0  # 원본 스케일 로스
-            count = 0
-            
-            for Xb, yb in train_loader:
-                y_pred = model(Xb)
-                loss = loss_fn(y_pred, yb)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                
-                with torch.no_grad():
-                    y_pred_np = y_pred.detach().cpu().numpy()
-                    yb_np = yb.detach().cpu().numpy()
-                    y_pred_scaled = self.scaler.inverse_y(y_pred_np)
-                    y_true_scaled = self.scaler.inverse_y(yb_np)
-                    y_pred_orig = y_pred_scaled / y_scale_factor
-                    y_true_orig = y_true_scaled / y_scale_factor
-                    mse_orig = np.mean((y_pred_orig - y_true_orig) ** 2)
-                    total_loss_original += mse_orig
-                    count += 1
-            
-            avg_loss = total_loss / len(train_loader)
-            avg_loss_original = total_loss_original / count if count > 0 else 0.0
-            final_loss = avg_loss
-            
-            val_loss_orig = None
-            if early_stopping_enabled:
-                model.eval()
-                val_loss_orig = 0.0
-                val_count = 0
-                
-                with torch.no_grad():
-                    for Xb, yb in val_loader:
-                        y_pred = model(Xb)
-                        y_pred_np = y_pred.cpu().numpy()
-                        yb_np = yb.cpu().numpy()
-                        y_pred_scaled = self.scaler.inverse_y(y_pred_np)
-                        y_true_scaled = self.scaler.inverse_y(yb_np)
-                        y_pred_orig = y_pred_scaled / y_scale_factor
-                        y_true_orig = y_true_scaled / y_scale_factor
-                        mse_orig = np.mean((y_pred_orig - y_true_orig) ** 2)
-                        val_loss_orig += mse_orig
-                        val_count += 1
-                
-                val_loss_orig /= max(val_count, 1)
-                
-                if val_loss_orig < (best_val_loss_orig - min_delta):
-                    best_val_loss_orig = val_loss_orig
-                    patience_counter = 0
-                    best_model_state = model.state_dict().copy()
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"  Early stopping at epoch {epoch+1}/{epochs} (best val loss: {best_val_loss_orig:.6f})")
-                        if best_model_state is not None:
-                            model.load_state_dict(best_model_state)
-                        break
-            
-            if (epoch + 1) % log_interval == 0 or (epoch + 1) == epochs:
-                if early_stopping_enabled and val_loss_orig is not None:
-                    print(f"  Epoch {epoch+1:03d}/{epochs} | Loss (scaled): {avg_loss:.6f} | Loss (original): {avg_loss_original:.6f} | Val Loss (original): {val_loss_orig:.6f}")
-                else:
-                    print(f"  Epoch {epoch+1:03d}/{epochs} | Loss (scaled): {avg_loss:.6f} | Loss (original): {avg_loss_original:.6f}")
-        
-        os.makedirs(self.model_dir, exist_ok=True)
-        model_path = os.path.join(self.model_dir, f"{ticker}_{self.agent_id}.pt")
-        torch.save({"model_state_dict": model.state_dict()}, model_path)
+            raise ValueError("ticker 미설정")
+
+        raw_csv_path = self._resolve_raw_csv_path()
+        df_raw = self._load_raw_csv(raw_csv_path)
+
+        trainer = TechnicalTrainer(self)
+        X, y = trainer.prepare_dataset(df_raw)
+        trainer.fit(X, y)
+        trainer.save()
+
         self.model_loaded = True
-        
-        final_loss_str = f" (Final Loss: {final_loss:.6f})" if final_loss is not None else ""
-        print(f"✅ {self.agent_id} 모델 학습 및 저장 완료: {model_path} (device: {device}){final_loss_str}")
-        
-        if common_params.get("pretrain_save_dataset", True):
-            dataset_path = os.path.join(self.data_dir, f"{ticker}_{self.agent_id}_dataset.csv")
-            flattened_data = []
-            dates_list = df_raw["Date"].values[:-1]
-            
-            for sample_idx in range(len(X_seq)):
-                for time_idx in range(window_size):
-                    date_idx = sample_idx + time_idx
-                    row = {
-                        'sample_id': sample_idx,
-                        'time_step': time_idx,
-                        'date': str(dates_list[date_idx]) if date_idx < len(dates_list) else None,
-                        'target': y_seq[sample_idx, 0] if time_idx == window_size - 1 else np.nan,
-                    }
-                    for feat_idx, feat_name in enumerate(feature_cols):
-                        row[feat_name] = X_seq[sample_idx, time_idx, feat_idx]
-                    flattened_data.append(row)
-            
-            dataset_df = pd.DataFrame(flattened_data)
-            os.makedirs(self.data_dir, exist_ok=True)
-            dataset_df.to_csv(dataset_path, index=False)
-            print(f"✅ 전처리된 데이터 저장 완료: {dataset_path}")
+
 
     def predict(self, X, n_samples: Optional[int] = None, current_price: Optional[float] = None, X_last: Optional[np.ndarray] = None):
         """예측 및 불확실성 추정"""
         if n_samples is None:
             n_samples = common_params.get("n_samples", 30)
-        
+
         if not self.ticker:
             raise ValueError("ticker가 설정되지 않았습니다. 먼저 searcher(ticker)를 호출하세요.")
-        
+
         model_path = os.path.join(self.model_dir, f"{self.ticker}_{self.agent_id}.pt")
         if not os.path.exists(model_path):
             if not self._in_pretrain:
@@ -1014,7 +535,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
         else:
             if not hasattr(self, "model_loaded") or not self.model_loaded:
                 self.load_model()
-        
+
         scaler_x_path = os.path.join(self.scaler.save_dir, f"{self.ticker}_{self.agent_id}_xscaler.pkl")
         if not os.path.exists(scaler_x_path):
             if not self._in_pretrain:
@@ -1026,7 +547,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
                     self._in_pretrain = False
             else:
                 raise RuntimeError(f"[{self.agent_id}] pretrain 중 predict 호출로 인한 재귀 호출 방지")
-        
+
         model = self
         self.scaler.load(self.ticker)
 
@@ -1048,7 +569,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
             if current_price is None and getattr(sd, "last_price", None) is not None:
                 current_price = float(sd.last_price)
             X = X_in
-        
+
         if isinstance(X, np.ndarray):
             X_raw_np = X.copy()
         elif isinstance(X, torch.Tensor):
@@ -1060,7 +581,7 @@ class TechnicalAgent(BaseAgent, nn.Module):
             X_raw_np = X_raw_np[None, :, :]
         elif X_raw_np.ndim == 3 and X_raw_np.shape[0] != 1:
             raise ValueError(f"예상하지 못한 배치 크기: {X_raw_np.shape[0]}")
-        
+
         X_scaled, _ = self.scaler.transform(X_raw_np)
         device = next(model.parameters()).device
         X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
@@ -1080,6 +601,8 @@ class TechnicalAgent(BaseAgent, nn.Module):
         sigma_min = common_params.get("sigma_min", 1e-6)
         sigma = max(sigma, sigma_min)
         confidence = self._calculate_confidence_from_direction_accuracy()
+        if confidence is None:
+            confidence = 0.5
         # 방향 정확도만 사용 (fallback 제거)
 
         if hasattr(self.scaler, "y_scaler") and self.scaler.y_scaler is not None:
@@ -1093,12 +616,12 @@ class TechnicalAgent(BaseAgent, nn.Module):
 
         y_scale_factor = common_params.get("y_scale_factor", 100.0)
         predicted_return = float(mean_pred[-1]) / y_scale_factor
-        
+
         cfg = agents_info.get(self.agent_id, {})
         return_clip_min = cfg.get("return_clip_min", -0.5)
         return_clip_max = cfg.get("return_clip_max", 0.5)
         predicted_return = np.clip(predicted_return, return_clip_min, return_clip_max)
-        
+
         predicted_price = current_price * (1 + predicted_return)
 
         target = Target(
@@ -1320,3 +843,110 @@ class TechnicalAgent(BaseAgent, nn.Module):
             "direction_accuracy": direction_accuracy,
             "n_samples": len(predictions),
         }
+
+
+
+    # 모델 준비
+    def _ensure_model_and_scaler(self):
+        """
+        모델과 스케일러가 준비되어 있는지 보장
+        없으면 pretrain 수행
+        """
+        if not self.ticker:
+            raise ValueError("ticker가 설정되지 않았습니다.")
+
+        model_path = os.path.join(self.model_dir, f"{self.ticker}_{self.agent_id}.pt")
+
+        # ---- 모델 확인 ----
+        if not os.path.exists(model_path):
+            if not getattr(self, "_in_pretrain", False):
+                print(f"[{self.agent_id}] 모델이 없어 pretrain() 실행")
+                self._in_pretrain = True
+                try:
+                    self.pretrain()
+                finally:
+                    self._in_pretrain = False
+            else:
+                raise RuntimeError("pretrain 중 predict 재귀 호출")
+        else:
+            if not getattr(self, "model_loaded", False):
+                self.load_model()
+
+        # ---- 스케일러 확인 ----
+        scaler_x_path = os.path.join(
+            self.scaler.save_dir,
+            f"{self.ticker}_{self.agent_id}_xscaler.pkl"
+        )
+
+        if not os.path.exists(scaler_x_path):
+            if not getattr(self, "_in_pretrain", False):
+                print(f"[{self.agent_id}] 스케일러가 없어 pretrain() 실행")
+                self._in_pretrain = True
+                try:
+                    self.pretrain()
+                finally:
+                    self._in_pretrain = False
+            else:
+                raise RuntimeError("pretrain 중 predict 재귀 호출")
+
+        self.scaler.load(self.ticker)
+    # 입력 준비
+    def _prepare_input(self, X, current_price: Optional[float]):
+        """
+        predict 입력(X)을 numpy array로 변환하고
+        current_price를 보정하여 반환
+        """
+        # -------------------------------------------------
+        # StockData 입력 처리
+        # -------------------------------------------------
+        if isinstance(X, StockData):
+            sd = X
+            X_in = getattr(sd, "X_seq", None)
+
+            if X_in is None:
+                X_in = getattr(sd, self.agent_id, None)
+
+                if isinstance(X_in, dict):
+                    feature_cols = getattr(sd, "feature_cols", None)
+                    if feature_cols:
+                        ordered = {c: X_in[c] for c in feature_cols if c in X_in}
+                        df = pd.DataFrame(ordered, columns=feature_cols)
+                    else:
+                        df = pd.DataFrame(X_in)
+                    X_in = df.values
+
+            if X_in is None:
+                raise ValueError(f"StockData에 {self.agent_id} 데이터가 없습니다.")
+
+            if current_price is None and getattr(sd, "last_price", None) is not None:
+                current_price = float(sd.last_price)
+
+            X = X_in
+
+        # -------------------------------------------------
+        # numpy / torch 입력 처리
+        # -------------------------------------------------
+        if isinstance(X, np.ndarray):
+            X_raw_np = X.copy()
+        elif isinstance(X, torch.Tensor):
+            X_raw_np = X.detach().cpu().numpy().copy()
+        else:
+            raise TypeError(f"Unsupported input type: {type(X)}")
+
+        # -------------------------------------------------
+        # shape 정규화
+        # -------------------------------------------------
+        if X_raw_np.ndim == 2:
+            X_raw_np = X_raw_np[None, :, :]
+        elif X_raw_np.ndim == 3 and X_raw_np.shape[0] != 1:
+            raise ValueError(f"예상하지 못한 배치 크기: {X_raw_np.shape[0]}")
+
+        # -------------------------------------------------
+        # current_price fallback
+        # -------------------------------------------------
+        if current_price is None:
+            last_price = getattr(getattr(self, "stockdata", None), "last_price", None)
+            default_price = common_params.get("default_current_price", 100.0)
+            current_price = default_price if last_price is None else float(last_price)
+
+        return X_raw_np, current_price
