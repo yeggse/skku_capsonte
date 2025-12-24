@@ -23,30 +23,92 @@
 ## 🏗️ 시스템 아키텍처 및 데이터 흐름
 
 ```mermaid
-graph TD
-    subgraph "Data Layer"
-        Raw[Raw Data: YFinance, EODHD]
-    end
+flowchart TB
 
-    subgraph "Expert Agents: Round 0"
-        A[Technical Agent: LSTM + Attention]
-        B[Sentimental Agent: FinBERT + LSTM]
-        C[Macro Agent: Stacked LSTM]
-    end
+%% =========================
+%% Agent Layer
+%% =========================
+subgraph AL["Agent Layer (Data & Models)"]
+    direction TB
 
-    subgraph "Debate Process: Round 1~N"
-        D[Debate System Orchestrator]
-        D -->|Rebuttal| D
-        D -->|Revise: Fine-tuning & Weight Adjustment| D
-    end
+    MD["Market Data<br/>(Price, Macro, News)"]
 
-    subgraph "Final Aggregation"
-        D --> |Features: Pred, Conf, Unc| E{LightGBM Meta Model}
-        E --> |Final Prediction| F[Investment Report & Dashboard]
-    end
+    subgraph AM["Individual Agents"]
+        direction LR
+        TA["TechnicalAgent<br/>(LSTM / GRU)"]
+        MA["MacroAgent<br/>(LSTM)"]
+        SA["SentimentalAgent<br/>(FinBERT + LSTM)"]
+    end
 
-    Raw --> A & B & C
-    A & B & C --> |Initial Opinions| D
+    PRE["Pretrain / Load Model<br/>(Weights & Scalers)"]
+    UE["Uncertainty & Confidence<br/>(Target Estimation)"]
+
+    MD --> AM
+    PRE --> AM
+    AM --> UE
+end
+
+%% =========================
+%% Debate Layer
+%% =========================
+subgraph DB["Debate Layer (Iterative LLM)"]
+    direction TB
+
+    R0["<b>Round 0: Opinion</b><br/>Initial prediction<br/>and reasoning"]
+
+    R1["<b>Round 1~N: Rebuttal</b><br/>Cross-review of others'<br/>opinions"]
+
+    RN["<b>Round 1~N: Revise</b><br/>Update prediction based<br/>on debate feedback"]
+
+    R0 --> R1
+    R1 --> RN
+    RN -- "Repeat N rounds" --> R1
+end
+
+%% =========================
+%% Ensemble Layer
+%% =========================
+subgraph EL["Ensemble Layer (Meta-Model)"]
+    direction TB
+
+    subgraph ET["Model Training (Optional)"]
+        direction TB
+        GD["Generate Training Data<br/>(Historical Agent Predictions)"]
+        LGBM_T["LightGBM Training<br/>(Directional MSE)"]
+        GD --> LGBM_T
+    end
+
+    IF["<b>Feature Input</b><br/>Ret / Conf / Unc<br/>(from 3 Agents)"]
+
+    LGBM_P["<b>Meta-Prediction</b><br/>LightGBM Inference"]
+
+    SUM["<b>Debate Summary</b><br/>LLM-based Narrative<br/>Conclusion"]
+
+    ET -.-> LGBM_P
+    IF --> LGBM_P
+    LGBM_P --> SUM
+end
+
+%% =========================
+%% Final Output
+%% =========================
+FO["<b>Final Result</b><br/>Ensemble Price &<br/>Analysis Summary"]
+
+%% =========================
+%% Cross-layer Connections
+%% =========================
+UE --> R0
+RN --> IF
+SUM --> FO
+
+%% =========================
+%% Styling
+%% =========================
+style AL fill:#f9f9f9,stroke:#333
+style DB fill:#fff4dd,stroke:#d4a017
+style EL fill:#e1f5fe,stroke:#01579b
+style ET fill:#f0f0f0,stroke:#666,stroke-dasharray: 5 5
+style FO fill:#d4edda,stroke:#28a745
 
 ```
 
