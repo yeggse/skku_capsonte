@@ -224,6 +224,7 @@ capstone/
 ├── scripts/            # 학습 데이터 생성 및 메타 모델 학습 스크립트
 ├── models/             # 학습된 모델(*.pt) 및 스케일러(*.pkl) 저장소
 ├── main.py             # CLI 진입점
+├── .env                # API KEY 세팅 파일
 └── streamlit_dashboard.py # 시각화 및 웹 대시보드
 
 ```
