@@ -228,7 +228,11 @@ capstone/
 └── streamlit_dashboard.py # 시각화 및 웹 대시보드
 
 ```
+---
+
+![information.jpg](information.jpg)
 
 ---
 
+```
 **Disclaimer**: 본 시스템은 투자 참고용이며, 모든 투자 결정의 책임은 사용자에게 있습니다.
